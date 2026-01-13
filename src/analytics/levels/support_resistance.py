@@ -115,19 +115,22 @@ class SupportResistanceAnalyzer:
         current = df.iloc[-1]
         prev = df.iloc[-2]
         current_volume = current["volume"]
-        avg_volume = df["volume"].tail(20).mean()
+        avg_volume = df["volume"].tail(20).mean() if len(df) >= 20 else current_volume
         
-        result = {"breakout": False, "level_type": None, "price": None}
+        result = {"breakout": False, "level_type": None, "price": None, "volume_confirmation": False}
         
         for level in levels.get("resistance_levels", []):
             if (prev["high"] < level["price"] and
                 current["high"] > level["price"]):
-                if not volume_confirmation or current_volume > avg_volume * 1.2:
+                vol_confirmed = current_volume > avg_volume * 1.2 if avg_volume > 0 else False
+                if not volume_confirmation or vol_confirmed:
                     result = {
                         "breakout": True,
                         "level_type": "resistance",
                         "price": level["price"],
-                        "strength": level["strength"]
+                        "strength": level["strength"],
+                        "volume_confirmation": vol_confirmed,
+                        "breakout_direction": "UP"
                     }
                     break
         
@@ -135,12 +138,15 @@ class SupportResistanceAnalyzer:
             for level in levels.get("support_levels", []):
                 if (prev["low"] > level["price"] and
                     current["low"] < level["price"]):
-                    if not volume_confirmation or current_volume > avg_volume * 1.2:
+                    vol_confirmed = current_volume > avg_volume * 1.2 if avg_volume > 0 else False
+                    if not volume_confirmation or vol_confirmed:
                         result = {
                             "breakout": True,
                             "level_type": "support",
                             "price": level["price"],
-                            "strength": level["strength"]
+                            "strength": level["strength"],
+                            "volume_confirmation": vol_confirmed,
+                            "breakout_direction": "DOWN"
                         }
                         break
         

@@ -79,6 +79,22 @@ class Signal(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class Breakout(Base):
+    """Модель для пробоев уровней."""
+    __tablename__ = "breakouts"
+    
+    id = Column(Integer, primary_key=True)
+    asset = Column(String, nullable=False, index=True)
+    timeframe = Column(String, nullable=False, index=True)
+    level_type = Column(String, nullable=False)
+    level_price = Column(Float, nullable=False)
+    level_strength = Column(Float, nullable=False)
+    breakout_price = Column(Float, nullable=False)
+    volume_confirmation = Column(Boolean, default=False)
+    timestamp = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class Database:
     """Класс для работы с базой данных."""
     
@@ -156,7 +172,26 @@ class Database:
         """Сохраняет торговый сигнал."""
         session = self.get_session()
         try:
-            signal = Signal(**signal_data)
+            import numpy as np
+            # Конвертируем numpy типы и bool в стандартные Python типы для JSON сериализации
+            signal_data_copy = signal_data.copy()
+            if "indicators" in signal_data_copy and isinstance(signal_data_copy["indicators"], dict):
+                indicators = signal_data_copy["indicators"].copy()
+                for key, value in indicators.items():
+                    if isinstance(value, (bool, np.bool_)):
+                        indicators[key] = bool(value)
+                    elif isinstance(value, (np.integer, np.floating)):
+                        indicators[key] = float(value) if isinstance(value, np.floating) else int(value)
+                signal_data_copy["indicators"] = indicators
+            
+            # Конвертируем numpy типы в основных полях
+            for key, value in signal_data_copy.items():
+                if isinstance(value, (np.integer, np.floating)):
+                    signal_data_copy[key] = float(value) if isinstance(value, np.floating) else int(value)
+                elif isinstance(value, (bool, np.bool_)):
+                    signal_data_copy[key] = bool(value)
+            
+            signal = Signal(**signal_data_copy)
             session.add(signal)
             session.commit()
             logger.info(f"Signal saved: {signal_data.get('signal_type')} for {signal_data.get('asset')}")
@@ -203,6 +238,21 @@ class Database:
         except Exception as e:
             session.rollback()
             logger.error(f"Error saving levels: {e}")
+            raise
+        finally:
+            session.close()
+    
+    def save_breakout(self, breakout_data: Dict[str, Any]):
+        """Сохраняет пробой уровня."""
+        session = self.get_session()
+        try:
+            breakout = Breakout(**breakout_data)
+            session.add(breakout)
+            session.commit()
+            logger.info(f"Breakout saved: {breakout_data.get('level_type')} at {breakout_data.get('level_price')} for {breakout_data.get('asset')}")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error saving breakout: {e}")
             raise
         finally:
             session.close()

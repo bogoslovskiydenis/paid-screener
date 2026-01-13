@@ -36,6 +36,8 @@ try:
     from src.analytics.signals.generator import SignalGenerator
     from src.analytics.levels.support_resistance import SupportResistanceAnalyzer
     from src.analytics.patterns.head_shoulders import HeadShouldersPattern
+    from src.analytics.patterns.chart_patterns import ChartPatternDetector
+    from src.analytics.indicators.rsi import RSICalculator
     print("✓ Модули проекта загружены")
 except ImportError as e:
     print(f"✗ Ошибка импорта модулей: {e}")
@@ -89,6 +91,10 @@ def main():
             min_pattern_length=config.get("analysis", {}).get("head_shoulders", {}).get("min_pattern_length", 20),
             symmetry_tolerance=config.get("analysis", {}).get("head_shoulders", {}).get("symmetry_tolerance", 0.1)
         )
+        chart_pattern_detector = ChartPatternDetector(
+            min_pattern_length=config.get("analysis", {}).get("head_shoulders", {}).get("min_pattern_length", 20),
+            price_tolerance=config.get("analysis", {}).get("support_resistance", {}).get("price_tolerance", 0.005)
+        )
         
         results = {}
         
@@ -130,6 +136,43 @@ def main():
                     
                     if levels:
                         database.save_levels(asset, timeframe, levels)
+                        
+                        # Проверка пробоев уровней
+                        breakout = levels_analyzer.check_breakout(df, levels, volume_confirmation=True)
+                        if breakout.get("breakout"):
+                            print(f"  ⚠ ПРОБОЙ УРОВНЯ: {breakout['level_type'].upper()} на ${breakout['price']:.2f}")
+                            print(f"    Направление: {breakout.get('breakout_direction', 'N/A')}")
+                            print(f"    Подтверждение объемом: {'✓' if breakout.get('volume_confirmation') else '✗'}")
+                            
+                            last_candle = df.iloc[-1]
+                            timestamp = last_candle.get("timestamp") if "timestamp" in df.columns else pd.Timestamp.now()
+                            if isinstance(timestamp, pd.Timestamp):
+                                timestamp = timestamp.to_pydatetime()
+                            
+                            breakout_data = {
+                                "asset": asset,
+                                "timeframe": timeframe,
+                                "level_type": breakout["level_type"],
+                                "level_price": breakout["price"],
+                                "level_strength": breakout["strength"],
+                                "breakout_price": float(last_candle["close"]),
+                                "volume_confirmation": breakout.get("volume_confirmation", False),
+                                "timestamp": timestamp
+                            }
+                            database.save_breakout(breakout_data)
+                    
+                    # RSI анализ
+                    rsi_calculator = RSICalculator(period=14)
+                    rsi_analysis = rsi_calculator.analyze(df)
+                    rsi_value = rsi_analysis.get("rsi")
+                    rsi_zone = rsi_analysis.get("rsi_zone", "NEUTRAL")
+                    rsi_signal = rsi_analysis.get("rsi_signal", "NEUTRAL")
+                    
+                    if rsi_value:
+                        signal_emoji = "🟢" if rsi_signal == "BUY" else "🔴" if rsi_signal == "SELL" else "🟡"
+                        print(f"  {signal_emoji} RSI: {rsi_value:.1f} ({rsi_zone})")
+                        if rsi_signal != "NEUTRAL":
+                            print(f"    Рекомендация: {'ПОКУПАТЬ' if rsi_signal == 'BUY' else 'ПРОДАВАТЬ'} (сила: {rsi_analysis.get('rsi_strength', 0):.1%})")
                     
                     # Свечные паттерны
                     from src.analytics.candlestick.patterns import CandlestickPatternAnalyzer
@@ -149,6 +192,25 @@ def main():
                         }
                         database.save_pattern(pattern_data)
                     
+                    # Дополнительные графические паттерны
+                    chart_patterns = chart_pattern_detector.detect_all(df)
+                    if chart_patterns:
+                        for cp in chart_patterns:
+                            print(f"  Графический паттерн: {cp['pattern_type']} ({cp['pattern_direction']})")
+                            pattern_data = {
+                                "asset": asset,
+                                "timeframe": timeframe,
+                                "pattern_type": cp.get("pattern_type"),
+                                "pattern_direction": cp.get("pattern_direction"),
+                                "neckline": cp.get("neckline"),
+                                "head_price": cp.get("head_price") or cp.get("peak1_price") or cp.get("apex_price"),
+                                "target_price": cp.get("target_price"),
+                                "completion_percentage": cp.get("completion_percentage", 0.0),
+                                "volume_confirmation": cp.get("volume_confirmation", False),
+                                "pattern_metadata": {k: v for k, v in cp.items() if k not in ["pattern_type", "pattern_direction", "neckline", "head_price", "target_price", "completion_percentage", "volume_confirmation"]}
+                            }
+                            database.save_pattern(pattern_data)
+                    
                     # Генерация сигнала
                     signal = signal_generator.generate_signal(asset, timeframe, df)
                     if signal:
@@ -161,14 +223,24 @@ def main():
                     else:
                         print("  Сигнал: не сгенерирован (низкая уверенность)")
                     
-                    results[asset][timeframe] = {
+                    result_data = {
                         "current_price": float(df.iloc[-1]['close']),
                         "candles_count": len(df),
+                        "rsi": rsi_analysis,
                         "candlestick_pattern": pattern,
                         "levels": levels,
                         "head_shoulders_pattern": hs_pattern,
+                        "chart_patterns": chart_patterns if chart_patterns else None,
                         "signal": signal
                     }
+                    
+                    # Добавляем информацию о пробое, если есть
+                    if levels:
+                        breakout = levels_analyzer.check_breakout(df, levels, volume_confirmation=True)
+                        if breakout.get("breakout"):
+                            result_data["breakout"] = breakout
+                    
+                    results[asset][timeframe] = result_data
                     
                 except Exception as e:
                     logger.error(f"Ошибка при обработке {asset}/{timeframe}: {e}")

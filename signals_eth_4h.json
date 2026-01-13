@@ -1,75 +1,151 @@
 {
   "ETH": {
     "4h": {
-      "current_price": 3135.25,
+      "current_price": 3134.55,
       "candles_count": 500,
-      "candlestick_pattern": null,
+      "rsi": {
+        "rsi": 90.03914745541724,
+        "rsi_signal": "SELL",
+        "rsi_zone": "OVERBOUGHT",
+        "rsi_strength": 1.0,
+        "rsi_period": 14
+      },
       "levels": {
         "support_levels": [
           {
-            "price": 3838.31,
+            "price": 2928.89,
             "strength": 1.0,
-            "touches": 15
+            "touches": 49
           },
           {
-            "price": 3859.0,
+            "price": 2944.54,
             "strength": 1.0,
-            "touches": 11
+            "touches": 35
           },
           {
-            "price": 3925.83,
+            "price": 3010.74,
             "strength": 1.0,
-            "touches": 12
+            "touches": 20
           },
           {
-            "price": 3564.13,
+            "price": 2910.25,
             "strength": 1.0,
-            "touches": 5
+            "touches": 10
           },
           {
-            "price": 3474.1,
+            "price": 2961.89,
             "strength": 1.0,
-            "touches": 5
+            "touches": 35
           }
         ],
         "resistance_levels": [
           {
-            "price": 3884.34,
+            "price": 2960.89,
             "strength": 1.0,
-            "touches": 18
+            "touches": 49
           },
           {
-            "price": 3905.22,
+            "price": 3048.45,
             "strength": 1.0,
-            "touches": 7
+            "touches": 20
           },
           {
-            "price": 3934.86,
+            "price": 3026.51,
             "strength": 1.0,
-            "touches": 7
+            "touches": 10
           },
           {
-            "price": 4026.39,
+            "price": 2946.0,
             "strength": 1.0,
-            "touches": 6
+            "touches": 10
           },
           {
-            "price": 3960.57,
+            "price": 3003.66,
             "strength": 1.0,
-            "touches": 8
+            "touches": 50
           }
         ]
       },
-      "head_shoulders_pattern": {
+      "pattern": {
         "pattern_type": "HEAD_AND_SHOULDERS",
         "pattern_direction": "BEARISH",
-        "neckline": 3274.605,
-        "head_price": 3447.44,
-        "target_price": 3101.77,
-        "completion_percentage": 0.0,
-        "volume_confirmation": "False"
+        "neckline": 3114.635,
+        "head_price": 3308.86,
+        "target_price": 2920.4100000000003,
+        "completion_percentage": 1.0,
+        "volume_confirmation": "True"
       },
-      "signal": null
+      "chart_patterns": [
+        {
+          "pattern_type": "DOUBLE_BOTTOM",
+          "pattern_direction": "BULLISH",
+          "bottom1_price": 3054.65,
+          "bottom2_price": 3058.69,
+          "neckline": 3148.41,
+          "target_price": 3242.1699999999996,
+          "completion_percentage": 0.1543302047781553,
+          "volume_confirmation": "True"
+        },
+        {
+          "pattern_type": "ASCENDING_TRIANGLE",
+          "pattern_direction": "BULLISH",
+          "apex_price": 3134.33,
+          "base_width": 20,
+          "completion_percentage": 0.5,
+          "volume_confirmation": "False"
+        },
+        {
+          "pattern_type": "PENNANT",
+          "pattern_direction": "BULLISH",
+          "pole_start": 3095.75,
+          "pole_end": 3122.01,
+          "pennant_breakout": 3134.55,
+          "completion_percentage": 0.7,
+          "volume_confirmation": "False"
+        },
+        {
+          "pattern_type": "RISING_WEDGE",
+          "pattern_direction": "BEARISH",
+          "apex_price": 3134.33,
+          "completion_percentage": 0.6,
+          "volume_confirmation": "False"
+        }
+      ],
+      "signal": {
+        "signal_type": "SELL",
+        "strength": "MEDIUM",
+        "entry_price": 3134.55,
+        "stop_loss": 3228.5865000000003,
+        "take_profit": [
+          {
+            "level": 2928.89,
+            "probability": 0.7
+          },
+          {
+            "level": 2944.54,
+            "probability": 0.49999999999999994
+          },
+          {
+            "level": 2920.4100000000003,
+            "probability": 0.6
+          }
+        ],
+        "indicators": {
+          "candlestick_pattern": "RSI: OVERBOUGHT (90.0)",
+          "support_level": 2928.89,
+          "resistance_level": 2960.89,
+          "volume_confirmation": "False",
+          "head_shoulders": true,
+          "rsi": 90.03914745541724,
+          "rsi_zone": "OVERBOUGHT",
+          "rsi_signal": "SELL"
+        },
+        "confidence": 0.7,
+        "asset": "ETH",
+        "timeframe": "4h",
+        "timestamp": "2026-01-13 12:15:39.304517",
+        "current_price": 3134.55
+      }
     }
   }
 }

@@ -14,6 +14,7 @@ try:
     from .analytics.signals.generator import SignalGenerator
     from .analytics.levels.support_resistance import SupportResistanceAnalyzer
     from .analytics.patterns.head_shoulders import HeadShouldersPattern
+    from .analytics.patterns.chart_patterns import ChartPatternDetector
 except ImportError:
     from utils.config import load_config, get_assets, get_timeframes, Settings
     from utils.logger import setup_logger
@@ -22,6 +23,7 @@ except ImportError:
     from analytics.signals.generator import SignalGenerator
     from analytics.levels.support_resistance import SupportResistanceAnalyzer
     from analytics.patterns.head_shoulders import HeadShouldersPattern
+    from analytics.patterns.chart_patterns import ChartPatternDetector
 
 logger = setup_logger(__name__)
 
@@ -52,6 +54,10 @@ class PaidScreener:
         self.pattern_analyzer = HeadShouldersPattern(
             min_pattern_length=self.config.get("analysis", {}).get("head_shoulders", {}).get("min_pattern_length", 20),
             symmetry_tolerance=self.config.get("analysis", {}).get("head_shoulders", {}).get("symmetry_tolerance", 0.1)
+        )
+        self.chart_pattern_detector = ChartPatternDetector(
+            min_pattern_length=self.config.get("analysis", {}).get("head_shoulders", {}).get("min_pattern_length", 20),
+            price_tolerance=self.config.get("analysis", {}).get("support_resistance", {}).get("price_tolerance", 0.005)
         )
     
     def fetch_and_save_data(
@@ -87,12 +93,41 @@ class PaidScreener:
                 logger.warning(f"Insufficient data for analysis: {asset}/{timeframe}")
                 return {}
             
-            results = {}
+            current_price = float(df.iloc[-1]["close"])
+            from .analytics.indicators.rsi import RSICalculator
+            rsi_calc = RSICalculator(period=14)
+            rsi_analysis = rsi_calc.analyze(df)
+            
+            results = {
+                "current_price": current_price,
+                "candles_count": len(df),
+                "rsi": rsi_analysis
+            }
             
             levels = self.levels_analyzer.find_levels(df)
             if levels:
                 results["levels"] = levels
                 self.database.save_levels(asset, timeframe, levels)
+                
+                breakout = self.levels_analyzer.check_breakout(df, levels, volume_confirmation=True)
+                if breakout.get("breakout"):
+                    results["breakout"] = breakout
+                    last_candle = df.iloc[-1]
+                    timestamp = last_candle.get("timestamp") if "timestamp" in df.columns else pd.Timestamp.now()
+                    if isinstance(timestamp, pd.Timestamp):
+                        timestamp = timestamp.to_pydatetime()
+                    
+                    breakout_data = {
+                        "asset": asset,
+                        "timeframe": timeframe,
+                        "level_type": breakout["level_type"],
+                        "level_price": breakout["price"],
+                        "level_strength": breakout["strength"],
+                        "breakout_price": current_price,
+                        "volume_confirmation": breakout.get("volume_confirmation", False),
+                        "timestamp": timestamp
+                    }
+                    self.database.save_breakout(breakout_data)
             
             pattern = self.pattern_analyzer.detect(df)
             if pattern:
@@ -103,6 +138,24 @@ class PaidScreener:
                     **pattern
                 }
                 self.database.save_pattern(pattern_data)
+            
+            chart_patterns = self.chart_pattern_detector.detect_all(df)
+            if chart_patterns:
+                results["chart_patterns"] = chart_patterns
+                for chart_pattern in chart_patterns:
+                    pattern_data = {
+                        "asset": asset,
+                        "timeframe": timeframe,
+                        "pattern_type": chart_pattern.get("pattern_type"),
+                        "pattern_direction": chart_pattern.get("pattern_direction"),
+                        "neckline": chart_pattern.get("neckline"),
+                        "head_price": chart_pattern.get("head_price") or chart_pattern.get("peak1_price") or chart_pattern.get("apex_price"),
+                        "target_price": chart_pattern.get("target_price"),
+                        "completion_percentage": chart_pattern.get("completion_percentage", 0.0),
+                        "volume_confirmation": chart_pattern.get("volume_confirmation", False),
+                        "pattern_metadata": {k: v for k, v in chart_pattern.items() if k not in ["pattern_type", "pattern_direction", "neckline", "head_price", "target_price", "completion_percentage", "volume_confirmation"]}
+                    }
+                    self.database.save_pattern(pattern_data)
             
             signal = self.signal_generator.generate_signal(asset, timeframe, df)
             if signal:

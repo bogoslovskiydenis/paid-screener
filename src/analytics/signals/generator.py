@@ -6,11 +6,13 @@ try:
     from ..candlestick.patterns import CandlestickPatternAnalyzer
     from ..levels.support_resistance import SupportResistanceAnalyzer
     from ..patterns.head_shoulders import HeadShouldersPattern
+    from ..indicators.rsi import RSICalculator
     from ...utils.logger import setup_logger
 except ImportError:
     from analytics.candlestick.patterns import CandlestickPatternAnalyzer
     from analytics.levels.support_resistance import SupportResistanceAnalyzer
     from analytics.patterns.head_shoulders import HeadShouldersPattern
+    from analytics.indicators.rsi import RSICalculator
     try:
         from utils.logger import setup_logger
     except ImportError:
@@ -29,6 +31,7 @@ class SignalGenerator:
         self.candlestick_analyzer = CandlestickPatternAnalyzer()
         self.levels_analyzer = SupportResistanceAnalyzer()
         self.pattern_analyzer = HeadShouldersPattern()
+        self.rsi_calculator = RSICalculator(period=14)
     
     def generate_signal(
         self,
@@ -46,13 +49,15 @@ class SignalGenerator:
         candlestick_pattern = self.candlestick_analyzer.analyze(df)
         levels = self.levels_analyzer.find_levels(df)
         head_shoulders = self.pattern_analyzer.detect(df)
+        rsi_analysis = self.rsi_calculator.analyze(df)
         
         signal_data = self._evaluate_signals(
             df,
             current_price,
             candlestick_pattern,
             levels,
-            head_shoulders
+            head_shoulders,
+            rsi_analysis
         )
         
         if not signal_data or signal_data["confidence"] < self.min_confidence:
@@ -73,7 +78,8 @@ class SignalGenerator:
         current_price: float,
         candlestick_pattern: Optional[str],
         levels: Dict[str, List[Dict[str, Any]]],
-        head_shoulders: Optional[Dict[str, Any]]
+        head_shoulders: Optional[Dict[str, Any]],
+        rsi_analysis: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """Оценивает сигналы и определяет тип."""
         buy_score = 0.0
@@ -81,6 +87,18 @@ class SignalGenerator:
         
         buy_factors = []
         sell_factors = []
+        
+        # RSI анализ
+        rsi_signal = rsi_analysis.get("rsi_signal", "NEUTRAL")
+        rsi_strength = rsi_analysis.get("rsi_strength", 0.0)
+        rsi_zone = rsi_analysis.get("rsi_zone", "NEUTRAL")
+        
+        if rsi_signal == "BUY":
+            buy_score += 0.3 * rsi_strength
+            buy_factors.append(f"RSI: {rsi_zone} ({rsi_analysis.get('rsi', 0):.1f})")
+        elif rsi_signal == "SELL":
+            sell_score += 0.3 * rsi_strength
+            sell_factors.append(f"RSI: {rsi_zone} ({rsi_analysis.get('rsi', 0):.1f})")
         
         if candlestick_pattern:
             if any(x in candlestick_pattern for x in ["Hammer", "Bullish Engulfing", "Morning Star"]):
@@ -128,7 +146,8 @@ class SignalGenerator:
                 buy_factors,
                 levels,
                 head_shoulders,
-                volume_confirmation
+                volume_confirmation,
+                rsi_analysis
             )
         elif sell_score > buy_score and sell_score > 0.5:
             return self._create_sell_signal(
@@ -138,7 +157,8 @@ class SignalGenerator:
                 sell_factors,
                 levels,
                 head_shoulders,
-                volume_confirmation
+                volume_confirmation,
+                rsi_analysis
             )
         
         return None
@@ -151,7 +171,8 @@ class SignalGenerator:
         factors: List[str],
         levels: Dict[str, List[Dict[str, Any]]],
         head_shoulders: Optional[Dict[str, Any]],
-        volume_confirmation: bool
+        volume_confirmation: bool,
+        rsi_analysis: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Создает сигнал на покупку."""
         support_levels = levels.get("support_levels", [])
@@ -197,7 +218,10 @@ class SignalGenerator:
                 "support_level": support_levels[0]["price"] if support_levels else None,
                 "resistance_level": resistance_levels[0]["price"] if resistance_levels else None,
                 "volume_confirmation": volume_confirmation,
-                "head_shoulders": head_shoulders is not None
+                "head_shoulders": head_shoulders is not None,
+                "rsi": rsi_analysis.get("rsi"),
+                "rsi_zone": rsi_analysis.get("rsi_zone"),
+                "rsi_signal": rsi_analysis.get("rsi_signal")
             },
             "confidence": confidence
         }
@@ -210,7 +234,8 @@ class SignalGenerator:
         factors: List[str],
         levels: Dict[str, List[Dict[str, Any]]],
         head_shoulders: Optional[Dict[str, Any]],
-        volume_confirmation: bool
+        volume_confirmation: bool,
+        rsi_analysis: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Создает сигнал на продажу."""
         support_levels = levels.get("support_levels", [])
@@ -256,7 +281,10 @@ class SignalGenerator:
                 "support_level": support_levels[0]["price"] if support_levels else None,
                 "resistance_level": resistance_levels[0]["price"] if resistance_levels else None,
                 "volume_confirmation": volume_confirmation,
-                "head_shoulders": head_shoulders is not None
+                "head_shoulders": head_shoulders is not None,
+                "rsi": rsi_analysis.get("rsi"),
+                "rsi_zone": rsi_analysis.get("rsi_zone"),
+                "rsi_signal": rsi_analysis.get("rsi_signal")
             },
             "confidence": confidence
         }
