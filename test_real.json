@@ -1,0 +1,71 @@
+{
+  "ETH": {
+    "4h": {
+      "levels": {
+        "support_levels": [
+          {
+            "price": 2912.15,
+            "strength": 1.0,
+            "touches": 68
+          },
+          {
+            "price": 2938.08,
+            "strength": 1.0,
+            "touches": 75
+          },
+          {
+            "price": 2886.8,
+            "strength": 1.0,
+            "touches": 15
+          },
+          {
+            "price": 2791.02,
+            "strength": 1.0,
+            "touches": 9
+          },
+          {
+            "price": 2821.34,
+            "strength": 1.0,
+            "touches": 12
+          }
+        ],
+        "resistance_levels": [
+          {
+            "price": 2968.0,
+            "strength": 1.0,
+            "touches": 89
+          },
+          {
+            "price": 2947.92,
+            "strength": 1.0,
+            "touches": 51
+          },
+          {
+            "price": 3030.92,
+            "strength": 1.0,
+            "touches": 24
+          },
+          {
+            "price": 2925.59,
+            "strength": 1.0,
+            "touches": 6
+          },
+          {
+            "price": 2837.8,
+            "strength": 1.0,
+            "touches": 12
+          }
+        ]
+      },
+      "pattern": {
+        "pattern_type": "HEAD_AND_SHOULDERS",
+        "pattern_direction": "BEARISH",
+        "neckline": 2995.8900000000003,
+        "head_price": 3077.39,
+        "target_price": 2914.390000000001,
+        "completion_percentage": 1.0,
+        "volume_confirmation": "True"
+      }
+    }
+  }
+}

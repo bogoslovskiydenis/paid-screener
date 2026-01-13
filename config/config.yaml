@@ -1,0 +1,39 @@
+assets:
+  - ETH
+  - SOL
+
+timeframes:
+  - 15m
+  - 4h
+  - 1d
+  - 1M
+
+exchanges:
+  binance:
+    enabled: true
+    rate_limit: 1200
+  bybit:
+    enabled: true
+    rate_limit: 120
+  okx:
+    enabled: true
+    rate_limit: 20
+
+database:
+  type: sqlite
+  path: data/screener.db
+
+analysis:
+  min_candles: 100
+  support_resistance:
+    min_touches: 2
+    price_tolerance: 0.005
+  head_shoulders:
+    min_pattern_length: 20
+    symmetry_tolerance: 0.1
+  signals:
+    min_confidence: 0.6
+
+updates:
+  interval_seconds: 60
+
