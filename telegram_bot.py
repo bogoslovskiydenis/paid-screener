@@ -103,6 +103,8 @@ def collect_buy_signals(
                 if has_bullish_4h_pattern and not has_bearish_4h_signal and strength != "STRONG":
                     continue
 
+            test_trade = signal.get("test_trade") or None
+
             results.append(
                 {
                     "asset": asset,
@@ -113,6 +115,7 @@ def collect_buy_signals(
                     "stop_loss": float(signal.get("stop_loss")),
                     "take_profit": signal.get("take_profit", []),
                     "confidence": confidence,
+                    "test_trade": test_trade,
                 }
             )
 

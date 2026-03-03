@@ -26,8 +26,9 @@ logger = setup_logger(__name__)
 class SignalGenerator:
     """Генератор торговых сигналов."""
     
-    def __init__(self, min_confidence: float = 0.6):
+    def __init__(self, min_confidence: float = 0.6, test_risk_usd: float = 10.0):
         self.min_confidence = min_confidence
+        self.test_risk_usd = float(test_risk_usd)
         self.candlestick_analyzer = CandlestickPatternAnalyzer()
         self.levels_analyzer = SupportResistanceAnalyzer()
         self.pattern_analyzer = HeadShouldersPattern()
@@ -65,12 +66,14 @@ class SignalGenerator:
         if not signal_data or signal_data["confidence"] < self.min_confidence:
             return None
         
-        signal_data.update({
-            "asset": asset,
-            "timeframe": timeframe,
-            "timestamp": datetime.utcnow(),
-            "current_price": current_price
-        })
+        signal_data.update(
+            {
+                "asset": asset,
+                "timeframe": timeframe,
+                "timestamp": datetime.utcnow(),
+                "current_price": current_price,
+            }
+        )
         
         return signal_data
     
@@ -269,6 +272,26 @@ class SignalGenerator:
             return None
 
         strength = "STRONG" if confidence >= 0.85 else "MEDIUM" if confidence >= 0.7 else "WEAK"
+
+        primary_tp_level = None
+        for tp in filtered_tp:
+            level = tp.get("level")
+            if isinstance(level, (int, float)):
+                primary_tp_level = float(level)
+                break
+
+        test_trade = None
+        risk = entry_price - stop_loss
+        if primary_tp_level is not None and risk > 0:
+            qty = self.test_risk_usd / risk
+            expected_reward = primary_tp_level - entry_price
+            expected_rr = expected_reward / risk if expected_reward > 0 else 0.0
+            test_trade = {
+                "risk_usd": self.test_risk_usd,
+                "qty": qty,
+                "entry_value_usd": qty * entry_price,
+                "expected_rr": expected_rr,
+            }
         
         return {
             "signal_type": "BUY",
@@ -286,7 +309,8 @@ class SignalGenerator:
                 "rsi_zone": rsi_analysis.get("rsi_zone"),
                 "rsi_signal": rsi_analysis.get("rsi_signal")
             },
-            "confidence": confidence
+            "confidence": confidence,
+            "test_trade": test_trade,
         }
     
     def _create_sell_signal(
@@ -346,6 +370,26 @@ class SignalGenerator:
             return None
 
         strength = "STRONG" if confidence >= 0.85 else "MEDIUM" if confidence >= 0.7 else "WEAK"
+
+        primary_tp_level = None
+        for tp in filtered_tp:
+            level = tp.get("level")
+            if isinstance(level, (int, float)):
+                primary_tp_level = float(level)
+                break
+
+        test_trade = None
+        risk = stop_loss - entry_price
+        if primary_tp_level is not None and risk > 0:
+            qty = self.test_risk_usd / risk
+            expected_reward = entry_price - primary_tp_level
+            expected_rr = expected_reward / risk if expected_reward > 0 else 0.0
+            test_trade = {
+                "risk_usd": self.test_risk_usd,
+                "qty": qty,
+                "entry_value_usd": qty * entry_price,
+                "expected_rr": expected_rr,
+            }
         
         return {
             "signal_type": "SELL",
@@ -363,7 +407,8 @@ class SignalGenerator:
                 "rsi_zone": rsi_analysis.get("rsi_zone"),
                 "rsi_signal": rsi_analysis.get("rsi_signal")
             },
-            "confidence": confidence
+            "confidence": confidence,
+            "test_trade": test_trade,
         }
     
     def _check_volume(self, df: pd.DataFrame) -> bool:

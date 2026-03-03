@@ -44,8 +44,10 @@ class PaidScreener:
         
         self.exchange_manager = ExchangeManager(enabled_exchanges)
         self.database = Database(self.settings.database_url)
+        signals_cfg = self.config.get("analysis", {}).get("signals", {}) or {}
         self.signal_generator = SignalGenerator(
-            min_confidence=self.config.get("analysis", {}).get("signals", {}).get("min_confidence", 0.6)
+            min_confidence=signals_cfg.get("min_confidence", 0.6),
+            test_risk_usd=signals_cfg.get("test_risk_usd", 10.0),
         )
         self.levels_analyzer = SupportResistanceAnalyzer(
             min_touches=self.config.get("analysis", {}).get("support_resistance", {}).get("min_touches", 2),

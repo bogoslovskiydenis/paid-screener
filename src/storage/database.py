@@ -77,6 +77,7 @@ class Signal(Base):
     indicators = Column(JSON, nullable=True)
     confidence = Column(Float, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    test_trade = Column(JSON, nullable=True)
 
 
 class Breakout(Base):
