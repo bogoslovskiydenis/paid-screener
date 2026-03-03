@@ -50,6 +50,7 @@ class SignalGenerator:
         levels = self.levels_analyzer.find_levels(df)
         head_shoulders = self.pattern_analyzer.detect(df)
         rsi_analysis = self.rsi_calculator.analyze(df)
+        breakout = self.levels_analyzer.check_breakout(df, levels, volume_confirmation=True)
         
         signal_data = self._evaluate_signals(
             df,
@@ -57,7 +58,8 @@ class SignalGenerator:
             candlestick_pattern,
             levels,
             head_shoulders,
-            rsi_analysis
+            rsi_analysis,
+            breakout,
         )
         
         if not signal_data or signal_data["confidence"] < self.min_confidence:
@@ -79,7 +81,8 @@ class SignalGenerator:
         candlestick_pattern: Optional[str],
         levels: Dict[str, List[Dict[str, Any]]],
         head_shoulders: Optional[Dict[str, Any]],
-        rsi_analysis: Dict[str, Any]
+        rsi_analysis: Dict[str, Any],
+        breakout: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Оценивает сигналы и определяет тип."""
         buy_score = 0.0
@@ -137,8 +140,21 @@ class SignalGenerator:
                 buy_score += 0.1
             else:
                 sell_score += 0.1
+
+        breakout_info = breakout or {}
+        if breakout_info.get("breakout"):
+            level_type = breakout_info.get("level_type")
+            direction = breakout_info.get("breakout_direction")
+            strength = breakout_info.get("strength", 1.0)
+            impact = 0.6 * float(strength)
+            if level_type == "resistance" and direction == "UP":
+                buy_score += impact
+                buy_factors.append(f"Breakout RESISTANCE at {breakout_info.get('price')}")
+            elif level_type == "support" and direction == "DOWN":
+                sell_score += impact
+                sell_factors.append(f"Breakout SUPPORT at {breakout_info.get('price')}")
         
-        if buy_score > sell_score and buy_score > 0.5:
+        if buy_score > sell_score and buy_score > 0.6:
             return self._create_buy_signal(
                 df,
                 current_price,
@@ -149,7 +165,7 @@ class SignalGenerator:
                 volume_confirmation,
                 rsi_analysis
             )
-        elif sell_score > buy_score and sell_score > 0.5:
+        elif sell_score > buy_score and sell_score > 0.6:
             return self._create_sell_signal(
                 df,
                 current_price,
@@ -205,7 +221,7 @@ class SignalGenerator:
         if not take_profit:
             take_profit = [{"level": current_price * 1.05, "probability": 0.7}]
         
-        strength = "STRONG" if confidence > 0.8 else "MEDIUM" if confidence > 0.65 else "WEAK"
+        strength = "STRONG" if confidence >= 0.85 else "MEDIUM" if confidence >= 0.7 else "WEAK"
         
         return {
             "signal_type": "BUY",
@@ -268,7 +284,7 @@ class SignalGenerator:
         if not take_profit:
             take_profit = [{"level": current_price * 0.95, "probability": 0.7}]
         
-        strength = "STRONG" if confidence > 0.8 else "MEDIUM" if confidence > 0.65 else "WEAK"
+        strength = "STRONG" if confidence >= 0.85 else "MEDIUM" if confidence >= 0.7 else "WEAK"
         
         return {
             "signal_type": "SELL",

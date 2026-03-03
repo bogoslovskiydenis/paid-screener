@@ -47,9 +47,40 @@ except ImportError as e:
 
 logger = setup_logger(__name__)
 
+
+def _btc_allows_buy(df: "pd.DataFrame", levels_analyzer: SupportResistanceAnalyzer) -> bool:
+    """Фильтр: разрешать ли покупки по альтам исходя из BTC."""
+    if df is None or df.empty or len(df) < 100:
+        return True
+
+    rsi_calculator = RSICalculator(period=14)
+    rsi_analysis = rsi_calculator.analyze(df)
+    rsi_signal = rsi_analysis.get("rsi_signal")
+    rsi_zone = rsi_analysis.get("rsi_zone", "NEUTRAL")
+
+    if rsi_signal == "SELL" and rsi_zone in ("OVERBOUGHT", "NEAR_OVERBOUGHT"):
+        return False
+
+    levels = levels_analyzer.find_levels(df)
+    if levels:
+        breakout = levels_analyzer.check_breakout(df, levels, volume_confirmation=True)
+        if (
+            breakout.get("breakout")
+            and breakout.get("level_type") == "support"
+            and breakout.get("breakout_direction") == "DOWN"
+        ):
+            return False
+
+    return True
+
 def main():
     parser = argparse.ArgumentParser(description="Paid Screener - реальные данные Binance")
-    parser.add_argument("--asset", type=str, default="ETH", help="Актив (ETH, SOL)")
+    parser.add_argument(
+        "--asset",
+        type=str,
+        default="ETH",
+        help="Актив или несколько активов через запятую (например: ETH,XRP)",
+    )
     parser.add_argument("--timeframes", type=str, default="4h", help="Таймфреймы через запятую (15m,4h,1d,1M)")
     parser.add_argument("--min-confidence", type=float, default=0.6, help="Минимальная уверенность сигнала")
     parser.add_argument("--export-json", action="store_true", help="Экспорт в JSON")
@@ -64,7 +95,11 @@ def main():
         config = load_config(args.config)
         settings = Settings()
         
-        assets = [args.asset] if args.asset else get_assets(config)
+        assets = (
+            [a.strip() for a in args.asset.split(",") if a.strip()]
+            if args.asset
+            else get_assets(config)
+        )
         timeframes = args.timeframes.split(",") if args.timeframes else get_timeframes(config)
         
         print(f"Активы: {', '.join(assets)}")
@@ -97,6 +132,7 @@ def main():
         )
         
         results = {}
+        btc_buy_allowed_cache = {}
         
         # Обработка каждого актива и таймфрейма
         for asset in assets:
@@ -211,8 +247,24 @@ def main():
                             }
                             database.save_pattern(pattern_data)
                     
+                    btc_buy_allowed = True
+                    if asset in ("ETH", "XRP", "SOL"):
+                        if timeframe in btc_buy_allowed_cache:
+                            btc_buy_allowed = btc_buy_allowed_cache[timeframe]
+                        else:
+                            try:
+                                btc_df = exchange_manager.get_ohlcv("BTC", timeframe, limit=args.limit)
+                            except Exception as e:
+                                logger.warning(f"Не удалось загрузить BTC для фильтра: {e}")
+                                btc_df = None
+                            btc_buy_allowed = _btc_allows_buy(btc_df, levels_analyzer)
+                            btc_buy_allowed_cache[timeframe] = btc_buy_allowed
+                    
                     # Генерация сигнала
                     signal = signal_generator.generate_signal(asset, timeframe, df)
+                    if signal and signal.get("signal_type") == "BUY" and not btc_buy_allowed:
+                        print("  Сигнал BUY заблокирован контекстом BTC")
+                        signal = None
                     if signal:
                         print(f"\n  ✓ СИГНАЛ: {signal['signal_type']} ({signal['strength']})")
                         print(f"    Уверенность: {signal['confidence']:.1%}")

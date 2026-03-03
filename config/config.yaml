@@ -32,7 +32,7 @@ analysis:
     min_pattern_length: 20
     symmetry_tolerance: 0.1
   signals:
-    min_confidence: 0.6
+    min_confidence: 0.8
 
 updates:
   interval_seconds: 60
