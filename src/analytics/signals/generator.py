@@ -179,6 +179,39 @@ class SignalGenerator:
         
         return None
     
+    def _is_risk_reward_acceptable(
+        self,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: List[Dict[str, Any]],
+        signal_type: str,
+        min_rr: float = 2.0,
+    ) -> bool:
+        if not take_profit:
+            return False
+
+        rr_values: List[float] = []
+        for tp in take_profit:
+            if not isinstance(tp, dict):
+                continue
+            level = tp.get("level")
+            if not isinstance(level, (int, float)):
+                continue
+            if signal_type == "BUY":
+                reward = level - entry_price
+                risk = entry_price - stop_loss
+            else:
+                reward = entry_price - level
+                risk = stop_loss - entry_price
+            if risk <= 0 or reward <= 0:
+                continue
+            rr_values.append(reward / risk)
+
+        if not rr_values:
+            return False
+
+        return max(rr_values) >= min_rr
+
     def _create_buy_signal(
         self,
         df: pd.DataFrame,
@@ -189,7 +222,7 @@ class SignalGenerator:
         head_shoulders: Optional[Dict[str, Any]],
         volume_confirmation: bool,
         rsi_analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         """Создает сигнал на покупку."""
         support_levels = levels.get("support_levels", [])
         resistance_levels = levels.get("resistance_levels", [])
@@ -217,10 +250,24 @@ class SignalGenerator:
                 "level": head_shoulders["target_price"],
                 "probability": 0.6
             })
+
+        filtered_tp = []
+        for tp in take_profit:
+            level = tp.get("level")
+            if isinstance(level, (int, float)) and level > current_price:
+                filtered_tp.append(tp)
+
+        if not filtered_tp:
+            filtered_tp = [{"level": current_price * 1.05, "probability": 0.7}]
         
-        if not take_profit:
-            take_profit = [{"level": current_price * 1.05, "probability": 0.7}]
-        
+        if not self._is_risk_reward_acceptable(
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=filtered_tp,
+            signal_type="BUY",
+        ):
+            return None
+
         strength = "STRONG" if confidence >= 0.85 else "MEDIUM" if confidence >= 0.7 else "WEAK"
         
         return {
@@ -228,7 +275,7 @@ class SignalGenerator:
             "strength": strength,
             "entry_price": entry_price,
             "stop_loss": stop_loss,
-            "take_profit": take_profit,
+            "take_profit": filtered_tp,
             "indicators": {
                 "candlestick_pattern": factors[0] if factors else None,
                 "support_level": support_levels[0]["price"] if support_levels else None,
@@ -252,7 +299,7 @@ class SignalGenerator:
         head_shoulders: Optional[Dict[str, Any]],
         volume_confirmation: bool,
         rsi_analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         """Создает сигнал на продажу."""
         support_levels = levels.get("support_levels", [])
         resistance_levels = levels.get("resistance_levels", [])
@@ -280,10 +327,24 @@ class SignalGenerator:
                 "level": head_shoulders["target_price"],
                 "probability": 0.6
             })
+
+        filtered_tp = []
+        for tp in take_profit:
+            level = tp.get("level")
+            if isinstance(level, (int, float)) and level < current_price:
+                filtered_tp.append(tp)
+
+        if not filtered_tp:
+            filtered_tp = [{"level": current_price * 0.95, "probability": 0.7}]
         
-        if not take_profit:
-            take_profit = [{"level": current_price * 0.95, "probability": 0.7}]
-        
+        if not self._is_risk_reward_acceptable(
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=filtered_tp,
+            signal_type="SELL",
+        ):
+            return None
+
         strength = "STRONG" if confidence >= 0.85 else "MEDIUM" if confidence >= 0.7 else "WEAK"
         
         return {
@@ -291,7 +352,7 @@ class SignalGenerator:
             "strength": strength,
             "entry_price": entry_price,
             "stop_loss": stop_loss,
-            "take_profit": take_profit,
+            "take_profit": filtered_tp,
             "indicators": {
                 "candlestick_pattern": factors[0] if factors else None,
                 "support_level": support_levels[0]["price"] if support_levels else None,

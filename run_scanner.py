@@ -9,8 +9,8 @@ from typing import List, Optional
 from src.utils.config import load_config
 
 
-ASSETS: List[str] = ["ETH", "XRP", "SOL"]
-TIMEFRAMES: List[str] = ["1h", "4h", "1d"]
+ASSETS: List[str] = ["ETH", "XRP", "SOL", "ADA", "NEAR"]
+TIMEFRAMES: List[str] = ["15m", "1h", "4h", "1d"]
 OUTPUT_FILE = "signals_eth_xrp_sol.json"
 INCLUDE_SELL = True
 

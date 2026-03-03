@@ -50,12 +50,12 @@ def collect_buy_signals(
             if allowed_types and signal_type not in allowed_types:
                 continue
 
+            strength = str(signal.get("strength") or "").upper()
             confidence = float(signal.get("confidence", 0.0))
             if confidence < min_confidence:
                 continue
 
-            strength = str(signal.get("strength") or "").upper()
-            if strength != "STRONG":
+            if strength not in ("MEDIUM", "STRONG"):
                 continue
 
             results.append(
@@ -80,6 +80,38 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
     lines.append("")
 
     for s in signals:
+        strength = str(s.get("strength") or "").upper()
+        if strength == "STRONG":
+            strength_ru = "СИЛЬНЫЙ"
+        elif strength == "MEDIUM":
+            strength_ru = "СРЕДНИЙ"
+        else:
+            strength_ru = strength or ""
+
+        entry = float(s.get("entry_price"))
+        sl = float(s.get("stop_loss"))
+        tp_list = s.get("take_profit", []) or []
+
+        rr_values: List[float] = []
+        for tp in tp_list:
+            if not isinstance(tp, dict):
+                continue
+            level = tp.get("level")
+            if not isinstance(level, (int, float)):
+                continue
+            if s.get("signal_type") == "BUY":
+                reward = level - entry
+                risk = entry - sl
+            else:
+                reward = entry - level
+                risk = sl - entry
+            if risk > 0 and reward > 0:
+                rr_values.append(reward / risk)
+
+        rr_text = ""
+        if rr_values:
+            best_rr = max(rr_values)
+            rr_text = f"R/R: {best_rr:.2f}"
         tp_levels = ", ".join(
             f"{tp.get('level'):.4f} (p={tp.get('probability', 0):.2f})"
             for tp in s.get("take_profit", [])
@@ -88,12 +120,14 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
 
         lines.append(
             f"{s['asset']} {s['timeframe']}: "
-            f"{s['signal_type']} {s.get('strength', '')} "
+            f"{s['signal_type']} ({strength_ru}) "
             f"(conf={s['confidence']:.2f})"
         )
         lines.append(
             f"Вход: {s['entry_price']:.4f}, SL: {s['stop_loss']:.4f}"
         )
+        if rr_text:
+            lines.append(rr_text)
         if tp_levels:
             lines.append(f"TP: {tp_levels}")
         lines.append("")
