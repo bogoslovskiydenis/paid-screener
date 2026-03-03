@@ -19,6 +19,12 @@ def load_signals(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def save_active_signals(path: Path, signals: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(signals, f, ensure_ascii=False, indent=2)
+
+
 def collect_buy_signals(
     data: Dict[str, Any],
     min_confidence: float,
@@ -346,6 +352,10 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
     if not filtered_signals:
         print("Нет сигналов, удовлетворяющих фильтрам.")
         return
+
+    # сохраняем активные сигналы для последующего трекинга TP/SL
+    active_signals_path = Path("data/active_signals.json")
+    save_active_signals(active_signals_path, filtered_signals)
 
     message = build_message(filtered_signals)
 
