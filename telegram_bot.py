@@ -142,6 +142,8 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
         sl = float(s.get("stop_loss"))
         tp_list = s.get("take_profit", []) or []
 
+        primary_tp_level: float | None = None
+
         rr_values: List[float] = []
         for tp in tp_list:
             if not isinstance(tp, dict):
@@ -149,6 +151,8 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
             level = tp.get("level")
             if not isinstance(level, (int, float)):
                 continue
+            if primary_tp_level is None:
+                primary_tp_level = float(level)
             if s.get("signal_type") == "BUY":
                 reward = level - entry
                 risk = entry - sl
@@ -173,6 +177,29 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
             f"{signal_type} ({strength_ru}) "
             f"(conf={s['confidence']:.2f})"
         )
+
+        if signal_type == "BUY" and timeframe in ("1h", "4h", "1d"):
+            if primary_tp_level is not None:
+                lines.append(
+                    f"СПОТ: цена входа {entry:.4f}, план закрытия {primary_tp_level:.4f}"
+                )
+            else:
+                lines.append(f"СПОТ: цена входа {entry:.4f}")
+        elif signal_type == "BUY":
+            if primary_tp_level is not None:
+                lines.append(
+                    f"ФЬЮЧЕРС ЛОНГ: цена входа {entry:.4f}, цена выхода {primary_tp_level:.4f}"
+                )
+            else:
+                lines.append(f"ФЬЮЧЕРС ЛОНГ: цена входа {entry:.4f}")
+        else:
+            if primary_tp_level is not None:
+                lines.append(
+                    f"ФЬЮЧЕРС ШОРТ: цена входа {entry:.4f}, цена выхода {primary_tp_level:.4f}"
+                )
+            else:
+                lines.append(f"ФЬЮЧЕРС ШОРТ: цена входа {entry:.4f}")
+
         lines.append(
             f"Вход: {s['entry_price']:.4f}, SL: {s['stop_loss']:.4f}"
         )
