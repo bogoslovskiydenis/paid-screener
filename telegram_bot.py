@@ -58,6 +58,45 @@ def collect_buy_signals(
             if strength not in ("MEDIUM", "STRONG"):
                 continue
 
+            rsi_info = tf_data.get("rsi") or {}
+            rsi_value = rsi_info.get("rsi")
+            if isinstance(rsi_value, (int, float)):
+                if signal_type == "SELL" and rsi_value < 30:
+                    continue
+                if signal_type == "BUY" and rsi_value > 70:
+                    continue
+
+            if timeframe == "1h" and signal_type == "SELL":
+                tf_15m = tf_map.get("15m") or {}
+                tf_4h = tf_map.get("4h") or {}
+
+                sig_15m = tf_15m.get("signal") or {}
+                sig_15m_type = sig_15m.get("signal_type")
+                sig_15m_strength = str(sig_15m.get("strength") or "").upper()
+                sig_15m_conf = float(sig_15m.get("confidence", 0.0))
+
+                has_valid_15m_sell = (
+                    sig_15m_type == "SELL"
+                    and sig_15m_strength in ("MEDIUM", "STRONG")
+                    and sig_15m_conf >= min_confidence
+                )
+
+                if not has_valid_15m_sell:
+                    continue
+
+                tf_4h_patterns = tf_4h.get("chart_patterns") or []
+                has_bullish_4h_pattern = any(
+                    isinstance(p, dict)
+                    and str(p.get("pattern_direction") or "").upper() == "BULLISH"
+                    for p in tf_4h_patterns
+                )
+
+                sig_4h = tf_4h.get("signal") or {}
+                has_bearish_4h_signal = sig_4h.get("signal_type") == "SELL"
+
+                if has_bullish_4h_pattern and not has_bearish_4h_signal and strength != "STRONG":
+                    continue
+
             results.append(
                 {
                     "asset": asset,
@@ -80,6 +119,17 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
     lines.append("")
 
     for s in signals:
+        signal_type = str(s.get("signal_type") or "").upper()
+        timeframe = str(s.get("timeframe") or "")
+
+        if signal_type == "BUY":
+            if timeframe in ("1h", "4h", "1d"):
+                mode_prefix = "[СПОТ/ЛОНГ]"
+            else:
+                mode_prefix = "[ЛОНГ]"
+        else:
+            mode_prefix = "[ШОРТ]"
+
         strength = str(s.get("strength") or "").upper()
         if strength == "STRONG":
             strength_ru = "СИЛЬНЫЙ"
@@ -119,8 +169,8 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
         )
 
         lines.append(
-            f"{s['asset']} {s['timeframe']}: "
-            f"{s['signal_type']} ({strength_ru}) "
+            f"{mode_prefix} {s['asset']} {s['timeframe']}: "
+            f"{signal_type} ({strength_ru}) "
             f"(conf={s['confidence']:.2f})"
         )
         lines.append(
