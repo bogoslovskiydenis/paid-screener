@@ -3,6 +3,8 @@
 import sys
 import argparse
 import json
+import time
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
@@ -48,8 +50,12 @@ except ImportError as e:
 logger = setup_logger(__name__)
 
 
-CRYPTO_ASSETS = {"ETH", "XRP", "SOL", "ADA", "NEAR", "BTC"}
+CRYPTO_ASSETS = {"ETH", "SOL", "BTC"}
 FUNDING_RATE_THRESHOLD = 0.0005  # 0.05% — граница перегрева
+
+# Таймфреймы по бирже
+BINANCE_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+INVESTING_TIMEFRAMES = ["5m", "1d"]
 
 
 def _btc_allows_buy(df: "pd.DataFrame", levels_analyzer: SupportResistanceAnalyzer) -> bool:
@@ -85,16 +91,19 @@ def main():
         default="ETH",
         help="Актив или несколько активов через запятую (например: ETH,XRP)",
     )
-    parser.add_argument("--timeframes", type=str, default="4h", help="Таймфреймы через запятую (15m,4h,1d,1M)")
+    parser.add_argument("--timeframes", type=str, default="", help="Переопределить таймфреймы для всех бирж (необязательно)")
     parser.add_argument("--min-confidence", type=float, default=0.6, help="Минимальная уверенность сигнала")
     parser.add_argument("--export-json", action="store_true", help="Экспорт в JSON")
     parser.add_argument("--output", type=str, default="signals.json", help="Файл вывода")
     parser.add_argument("--limit", type=int, default=500, help="Количество свечей для загрузки")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Путь к конфигурации")
-    
+    parser.add_argument("--loop", action="store_true", help="Запустить в бесконечном цикле")
+    parser.add_argument("--loop-interval", type=int, default=300, help="Интервал между итерациями в секундах (default: 300)")
+
     args = parser.parse_args()
-    
-    try:
+
+    while True:
+      try:
         # Загрузка конфигурации
         config = load_config(args.config)
         settings = Settings()
@@ -104,10 +113,15 @@ def main():
             if args.asset
             else get_assets(config)
         )
-        timeframes = args.timeframes.split(",") if args.timeframes else get_timeframes(config)
-        
+        override_timeframes = (
+            [t.strip() for t in args.timeframes.split(",") if t.strip()]
+            if args.timeframes
+            else None
+        )
+
         print(f"Активы: {', '.join(assets)}")
-        print(f"Таймфреймы: {', '.join(timeframes)}")
+        print(f"Binance таймфреймы: {', '.join(override_timeframes or BINANCE_TIMEFRAMES)}")
+        print(f"Investing таймфреймы: {', '.join(override_timeframes or INVESTING_TIMEFRAMES)}")
         print(f"Количество свечей: {args.limit}")
         print("=" * 70)
         print()
@@ -135,21 +149,25 @@ def main():
             price_tolerance=config.get("analysis", {}).get("support_resistance", {}).get("price_tolerance", 0.005)
         )
         
+        from src.parsers.exchange_manager import BINANCE_SYMBOLS
+
         results = {}
         btc_buy_allowed_cache = {}
         funding_rate_cache = {}
-        
+
         # Обработка каждого актива и таймфрейма
         for asset in assets:
             results[asset] = {}
-            
+            is_binance = asset.upper() in BINANCE_SYMBOLS
+            timeframes = override_timeframes or (BINANCE_TIMEFRAMES if is_binance else INVESTING_TIMEFRAMES)
+
             for timeframe in timeframes:
                 print(f"Обработка {asset}/{timeframe}...")
                 print("-" * 70)
                 
                 try:
-                    # Загрузка данных с Binance
-                    print(f"Загрузка данных с Binance...")
+                    source = "Binance" if is_binance else "Investing.com"
+                    print(f"Загрузка данных с {source}...")
                     df = exchange_manager.get_ohlcv(asset, timeframe, limit=args.limit)
                     
                     if df.empty:
@@ -253,7 +271,7 @@ def main():
                             database.save_pattern(pattern_data)
                     
                     btc_buy_allowed = True
-                    if asset in ("ETH", "XRP", "SOL", "ADA", "NEAR"):
+                    if asset in ("ETH", "SOL"):
                         if timeframe in btc_buy_allowed_cache:
                             btc_buy_allowed = btc_buy_allowed_cache[timeframe]
                         else:
@@ -360,12 +378,34 @@ def main():
         print("=" * 70)
         print("Анализ завершен!")
         print("=" * 70)
-        
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+
+        if args.export_json and args.loop:
+            try:
+                subprocess.run(
+                    [
+                        sys.executable, "telegram_bot.py",
+                        "--mode", "send",
+                        "--signals-file", args.output,
+                        "--include-sell",
+                    ],
+                    check=False,
+                )
+            except Exception as tg_exc:
+                logger.warning(f"Ошибка запуска telegram_bot: {tg_exc}")
+
+      except KeyboardInterrupt:
+        print("\nОстановлено вручную.")
+        break
+      except Exception as e:
+        logger.error(f"Ошибка итерации: {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+
+      if not args.loop:
+        break
+
+      print(f"\nСледующий запуск через {args.loop_interval} сек... (Ctrl+C для остановки)\n")
+      time.sleep(args.loop_interval)
 
 if __name__ == "__main__":
     main()

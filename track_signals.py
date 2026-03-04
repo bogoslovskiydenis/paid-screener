@@ -20,7 +20,7 @@ SUBSCRIBERS_PATH = Path("data/telegram_subscribers.json")
 STATS_PATH = Path("data/trade_stats.json")
 
 # Только эти активы отслеживаем — остальные (акции) пропускаем
-BINANCE_ASSETS = {"ETH", "SOL", "ADA", "NEAR", "XRP"}
+BINANCE_ASSETS = {"ETH", "SOL"}
 
 
 def load_active_signals(path: Path) -> List[Dict[str, Any]]:
@@ -175,7 +175,7 @@ def build_result_message(
 
 
 def track_signals(interval_seconds: int = 60) -> None:
-    exchange_manager = ExchangeManager(["binance"])
+    exchange_manager = ExchangeManager(["binance", "investing"])
     subscribers = load_subscribers(SUBSCRIBERS_PATH)
     if not subscribers:
         print("Подписчиков нет, отслеживать некому.")

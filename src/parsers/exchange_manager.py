@@ -11,37 +11,8 @@ from ..utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
-STOCK_SYMBOLS: Set[str] = {
-    "MU",
-    "SNDK",
-    "LITE",
-    "TSM",
-    "GOOGL",
-    "GOOG",
-    "ASML",
-    "AMD",
-    "AMZN",
-    "PLTR",
-    "MRVL",
-    "AVGO",
-    "FXI",
-    "NFLX",
-    "META",
-    "NVDA",
-    "MSFT",
-    "IWM",
-    "QQQ",
-    "SPY",
-    "XLF",
-    "AAPL",
-    "DIA",
-    "XLP",
-    "GLD",
-    "XOP",
-    "SLV",
-    "USO",
-    "TSLA",
-}
+# Только эти активы идут на Binance; всё остальное — на Investing
+BINANCE_SYMBOLS: Set[str] = {"ETH", "SOL", "BTC"}
 
 
 class ExchangeManager:
@@ -73,11 +44,11 @@ class ExchangeManager:
             return self.parsers[exchange]
 
         asset_upper = (asset or "").upper()
-        if asset_upper in STOCK_SYMBOLS and "investing" in self.parsers:
-            return self.parsers["investing"]
-
-        if "binance" in self.parsers:
+        if asset_upper in BINANCE_SYMBOLS and "binance" in self.parsers:
             return self.parsers["binance"]
+
+        if "investing" in self.parsers:
+            return self.parsers["investing"]
 
         if self.parsers:
             return list(self.parsers.values())[0]

@@ -358,7 +358,15 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
         print("Подписчиков нет, рассылать некому.")
         return
 
-    data = load_signals(signals_file)
+    # поддержка нескольких файлов через запятую
+    signal_files = [Path(f.strip()) for f in str(signals_file).split(",") if f.strip()]
+    data: Dict[str, Any] = {}
+    for sf in signal_files:
+        try:
+            chunk = load_signals(sf)
+            data.update(chunk)
+        except FileNotFoundError:
+            print(f"Файл не найден, пропускаем: {sf}")
 
     asset_filter = (
         [a.strip() for a in args.asset.split(",") if a.strip()]
@@ -425,7 +433,7 @@ def parse_args() -> argparse.Namespace:
         "--signals-file",
         type=str,
         default="signals.json",
-        help="Путь к JSON файлу с сигналами (из run_real.py --export-json)",
+        help="Путь к JSON файлу(ам) с сигналами, через запятую (например: signals_binance.json,signals_stocks.json)",
     )
     parser.add_argument(
         "--min-confidence",
