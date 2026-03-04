@@ -3,12 +3,42 @@ assets:
   - SOL
   - ADA
   - NEAR
+  - MU
+  - SNDK
+  - LITE
+  - TSM
+  - GOOGL
+  - GOOG
+  - ASML
+  - AMD
+  - AMZN
+  - PLTR
+  - MRVL
+  - AVGO
+  - FXI
+  - NFLX
+  - META
+  - NVDA
+  - MSFT
+  - IWM
+  - QQQ
+  - SPY
+  - XLF
+  - AAPL
+  - DIA
+  - XLP
+  - GLD
+  - XOP
+  - SLV
+  - USO
+  - TSLA
 
 timeframes:
+  - 5m
   - 15m
+  - 1h
   - 4h
   - 1d
-  - 1M
 
 exchanges:
   binance:
@@ -20,6 +50,9 @@ exchanges:
   okx:
     enabled: true
     rate_limit: 20
+  investing:
+    enabled: true
+    rate_limit: 120
 
 database:
   type: sqlite

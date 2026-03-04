@@ -151,7 +151,7 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
         sl = float(s.get("stop_loss"))
         tp_list = s.get("take_profit", []) or []
 
-        primary_tp_level: float | None = None
+        primary_tp_level = None
 
         rr_values: List[float] = []
         for tp in tp_list:

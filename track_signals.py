@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -71,7 +73,7 @@ def save_stats(path: Path, stats: Dict[str, Any]) -> None:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
 
-def get_tp_level(signal: Dict[str, Any]) -> float | None:
+def get_tp_level(signal: Dict[str, Any]) -> Optional[float]:
     tp_list = signal.get("take_profit") or []
     for tp in tp_list:
         if isinstance(tp, dict) and isinstance(tp.get("level"), (int, float)):
@@ -85,7 +87,7 @@ def check_hit(
     signal_type: str,
     tp_level: float,
     sl_level: float,
-) -> Tuple[str | None, float | None]:
+) -> Tuple[Optional[str], Optional[float]]:
     side = (signal_type or "").upper()
 
     if side == "BUY":
@@ -109,12 +111,12 @@ def build_result_message(
     strength: str,
     result: str,
     price: float,
-    test_pnl_usd: float | None = None,
-    test_pnl_rr: float | None = None,
-    risk_usd: float | None = None,
-    win_rate: float | None = None,
-    total_closed: int | None = None,
-    wins: int | None = None,
+    test_pnl_usd: Optional[float] = None,
+    test_pnl_rr: Optional[float] = None,
+    risk_usd: Optional[float] = None,
+    win_rate: Optional[float] = None,
+    total_closed: Optional[int] = None,
+    wins: Optional[int] = None,
 ) -> str:
     side = (signal_type or "").upper()
     strength_ru = ""
@@ -185,11 +187,14 @@ def track_signals(interval_seconds: int = 60) -> None:
             except Exception as exc:
                 print(f"Ошибка получения цены для {asset} {timeframe}: {exc}")
                 updated_signals.append(signal)
+                time.sleep(1.0)
                 continue
 
             if df.empty:
                 updated_signals.append(signal)
                 continue
+
+            time.sleep(0.4)
 
             last = df.iloc[-1]
             price_high = float(last["high"])

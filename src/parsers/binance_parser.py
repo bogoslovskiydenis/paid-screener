@@ -8,15 +8,18 @@ from ..utils.retry import retry_with_backoff
 
 class BinanceParser(BaseParser):
     """Парсер данных с Binance."""
-    
-    def __init__(self):
+
+    def __init__(self, market_type: str = "future"):
         super().__init__("binance")
         try:
             import ccxt
-            self.exchange = ccxt.binance({
+            options = {
                 "enableRateLimit": True,
                 "rateLimit": 1200,
-            })
+            }
+            if market_type == "future":
+                options["options"] = {"defaultType": "future"}
+            self.exchange = ccxt.binance(options)
         except ImportError:
             raise ImportError("ccxt library is required for Binance parser")
     

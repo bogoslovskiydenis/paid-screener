@@ -1,22 +1,17 @@
 from pathlib import Path
 
-from src.storage.database import Database, Signal, Breakout, Pattern, SupportResistanceLevel, Candle
 from src.utils.config import Settings
 
 
 def reset_database() -> None:
     settings = Settings()
-    db = Database(settings.database_url)
-    session = db.get_session()
-    try:
-        # чистим только сигналы и производные объекты
-        session.query(Signal).delete()
-        session.query(Breakout).delete()
-        session.query(Pattern).delete()
-        session.query(SupportResistanceLevel).delete()
-        session.commit()
-    finally:
-        session.close()
+    db_url = settings.database_url
+
+    if db_url.startswith("sqlite:///"):
+        db_path_str = db_url.replace("sqlite:///", "", 1)
+        db_path = Path(db_path_str)
+        if db_path.exists():
+            db_path.unlink()
 
 
 def reset_active_signals() -> None:
