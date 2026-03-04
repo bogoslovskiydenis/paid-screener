@@ -7,12 +7,18 @@ try:
     from ..levels.support_resistance import SupportResistanceAnalyzer
     from ..patterns.head_shoulders import HeadShouldersPattern
     from ..indicators.rsi import RSICalculator
+    from ..indicators.atr import ATRCalculator
+    from ..indicators.ema import EMACalculator
+    from ..indicators.macd import MACDCalculator
     from ...utils.logger import setup_logger
 except ImportError:
     from analytics.candlestick.patterns import CandlestickPatternAnalyzer
     from analytics.levels.support_resistance import SupportResistanceAnalyzer
     from analytics.patterns.head_shoulders import HeadShouldersPattern
     from analytics.indicators.rsi import RSICalculator
+    from analytics.indicators.atr import ATRCalculator
+    from analytics.indicators.ema import EMACalculator
+    from analytics.indicators.macd import MACDCalculator
     try:
         from utils.logger import setup_logger
     except ImportError:
@@ -33,6 +39,9 @@ class SignalGenerator:
         self.levels_analyzer = SupportResistanceAnalyzer()
         self.pattern_analyzer = HeadShouldersPattern()
         self.rsi_calculator = RSICalculator(period=14)
+        self.atr_calculator = ATRCalculator(period=14)
+        self.ema_calculator = EMACalculator(periods=[9, 21, 50])
+        self.macd_calculator = MACDCalculator()
     
     def generate_signal(
         self,
@@ -52,7 +61,10 @@ class SignalGenerator:
         head_shoulders = self.pattern_analyzer.detect(df)
         rsi_analysis = self.rsi_calculator.analyze(df)
         breakout = self.levels_analyzer.check_breakout(df, levels, volume_confirmation=True)
-        
+        atr_value = self.atr_calculator.get_current(df)
+        ema_analysis = self.ema_calculator.analyze(df)
+        macd_analysis = self.macd_calculator.analyze(df)
+
         signal_data = self._evaluate_signals(
             df,
             current_price,
@@ -61,6 +73,9 @@ class SignalGenerator:
             head_shoulders,
             rsi_analysis,
             breakout,
+            atr_value=atr_value,
+            ema_analysis=ema_analysis,
+            macd_analysis=macd_analysis,
         )
         
         if not signal_data or signal_data["confidence"] < self.min_confidence:
@@ -86,6 +101,9 @@ class SignalGenerator:
         head_shoulders: Optional[Dict[str, Any]],
         rsi_analysis: Dict[str, Any],
         breakout: Optional[Dict[str, Any]] = None,
+        atr_value: Optional[float] = None,
+        ema_analysis: Optional[Dict[str, Any]] = None,
+        macd_analysis: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Оценивает сигналы и определяет тип."""
         buy_score = 0.0
@@ -157,27 +175,56 @@ class SignalGenerator:
                 sell_score += impact
                 sell_factors.append(f"Breakout SUPPORT at {breakout_info.get('price')}")
         
+        # EMA trend
+        ema = ema_analysis or {}
+        ema_trend = ema.get("trend", "NEUTRAL")
+        ema_cross = ema.get("ema_cross", "NEUTRAL")
+        if ema_trend == "BULLISH":
+            buy_score += 0.15
+            buy_factors.append("EMA50: цена выше тренда")
+        elif ema_trend == "BEARISH":
+            sell_score += 0.15
+            sell_factors.append("EMA50: цена ниже тренда")
+        if ema_cross == "BULLISH":
+            buy_score += 0.1
+            buy_factors.append("EMA9/21: бычье пересечение")
+        elif ema_cross == "BEARISH":
+            sell_score += 0.1
+            sell_factors.append("EMA9/21: медвежье пересечение")
+
+        # MACD
+        macd = macd_analysis or {}
+        macd_sig = macd.get("macd_signal", "NEUTRAL")
+        macd_div = macd.get("divergence")
+        if macd_sig == "BUY":
+            weight = 0.25 if macd.get("bullish_cross") else 0.15
+            buy_score += weight
+            buy_factors.append("MACD: бычье пересечение" if macd.get("bullish_cross") else "MACD: бычий импульс")
+        elif macd_sig == "SELL":
+            weight = 0.25 if macd.get("bearish_cross") else 0.15
+            sell_score += weight
+            sell_factors.append("MACD: медвежье пересечение" if macd.get("bearish_cross") else "MACD: медвежий импульс")
+        if macd_div == "BULLISH":
+            buy_score += 0.2
+            buy_factors.append("MACD дивергенция: бычья")
+        elif macd_div == "BEARISH":
+            sell_score += 0.2
+            sell_factors.append("MACD дивергенция: медвежья")
+
+        buy_score = min(buy_score, 1.0)
+        sell_score = min(sell_score, 1.0)
+
         if buy_score > sell_score and buy_score > 0.6:
             return self._create_buy_signal(
-                df,
-                current_price,
-                buy_score,
-                buy_factors,
-                levels,
-                head_shoulders,
-                volume_confirmation,
-                rsi_analysis
+                df, current_price, buy_score, buy_factors,
+                levels, head_shoulders, volume_confirmation, rsi_analysis,
+                atr_value=atr_value, ema_analysis=ema_analysis, macd_analysis=macd_analysis,
             )
         elif sell_score > buy_score and sell_score > 0.6:
             return self._create_sell_signal(
-                df,
-                current_price,
-                sell_score,
-                sell_factors,
-                levels,
-                head_shoulders,
-                volume_confirmation,
-                rsi_analysis
+                df, current_price, sell_score, sell_factors,
+                levels, head_shoulders, volume_confirmation, rsi_analysis,
+                atr_value=atr_value, ema_analysis=ema_analysis, macd_analysis=macd_analysis,
             )
         
         return None
@@ -224,21 +271,24 @@ class SignalGenerator:
         levels: Dict[str, List[Dict[str, Any]]],
         head_shoulders: Optional[Dict[str, Any]],
         volume_confirmation: bool,
-        rsi_analysis: Dict[str, Any]
+        rsi_analysis: Dict[str, Any],
+        atr_value: Optional[float] = None,
+        ema_analysis: Optional[Dict[str, Any]] = None,
+        macd_analysis: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Создает сигнал на покупку."""
         support_levels = levels.get("support_levels", [])
         resistance_levels = levels.get("resistance_levels", [])
         
         entry_price = current_price
-        stop_loss = current_price * 0.97
-        
+        stop_loss = (current_price - 1.5 * atr_value) if atr_value else current_price * 0.97
+
         if support_levels:
-            nearest_support = max([s for s in support_levels if s["price"] < current_price], 
-                                 key=lambda x: x["price"], default=None)
+            nearest_support = max([s for s in support_levels if s["price"] < current_price],
+                                  key=lambda x: x["price"], default=None)
             if nearest_support:
                 stop_loss = nearest_support["price"] * 0.995
-        
+
         take_profit = []
         if resistance_levels:
             for i, res in enumerate(resistance_levels[:2]):
@@ -293,6 +343,10 @@ class SignalGenerator:
                 "expected_rr": expected_rr,
             }
         
+        cs_factor = next((f for f in factors if f.startswith("Candlestick:")), None)
+        ema = ema_analysis or {}
+        macd = macd_analysis or {}
+
         return {
             "signal_type": "BUY",
             "strength": strength,
@@ -300,14 +354,23 @@ class SignalGenerator:
             "stop_loss": stop_loss,
             "take_profit": filtered_tp,
             "indicators": {
-                "candlestick_pattern": factors[0] if factors else None,
+                "candlestick_pattern": cs_factor,
                 "support_level": support_levels[0]["price"] if support_levels else None,
                 "resistance_level": resistance_levels[0]["price"] if resistance_levels else None,
                 "volume_confirmation": volume_confirmation,
                 "head_shoulders": head_shoulders is not None,
                 "rsi": rsi_analysis.get("rsi"),
                 "rsi_zone": rsi_analysis.get("rsi_zone"),
-                "rsi_signal": rsi_analysis.get("rsi_signal")
+                "rsi_signal": rsi_analysis.get("rsi_signal"),
+                "atr": atr_value,
+                "ema_trend": ema.get("trend"),
+                "ema_cross": ema.get("ema_cross"),
+                "ema9": ema.get("ema9"),
+                "ema21": ema.get("ema21"),
+                "ema50": ema.get("ema50"),
+                "macd_signal": macd.get("macd_signal"),
+                "macd_divergence": macd.get("divergence"),
+                "macd_cross": macd.get("bullish_cross"),
             },
             "confidence": confidence,
             "test_trade": test_trade,
@@ -322,18 +385,21 @@ class SignalGenerator:
         levels: Dict[str, List[Dict[str, Any]]],
         head_shoulders: Optional[Dict[str, Any]],
         volume_confirmation: bool,
-        rsi_analysis: Dict[str, Any]
+        rsi_analysis: Dict[str, Any],
+        atr_value: Optional[float] = None,
+        ema_analysis: Optional[Dict[str, Any]] = None,
+        macd_analysis: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Создает сигнал на продажу."""
         support_levels = levels.get("support_levels", [])
         resistance_levels = levels.get("resistance_levels", [])
         
         entry_price = current_price
-        stop_loss = current_price * 1.03
-        
+        stop_loss = (current_price + 1.5 * atr_value) if atr_value else current_price * 1.03
+
         if resistance_levels:
             nearest_resistance = min([r for r in resistance_levels if r["price"] > current_price],
-                                    key=lambda x: x["price"], default=None)
+                                     key=lambda x: x["price"], default=None)
             if nearest_resistance:
                 stop_loss = nearest_resistance["price"] * 1.005
         
@@ -391,6 +457,10 @@ class SignalGenerator:
                 "expected_rr": expected_rr,
             }
         
+        cs_factor = next((f for f in factors if f.startswith("Candlestick:")), None)
+        ema = ema_analysis or {}
+        macd = macd_analysis or {}
+
         return {
             "signal_type": "SELL",
             "strength": strength,
@@ -398,14 +468,23 @@ class SignalGenerator:
             "stop_loss": stop_loss,
             "take_profit": filtered_tp,
             "indicators": {
-                "candlestick_pattern": factors[0] if factors else None,
+                "candlestick_pattern": cs_factor,
                 "support_level": support_levels[0]["price"] if support_levels else None,
                 "resistance_level": resistance_levels[0]["price"] if resistance_levels else None,
                 "volume_confirmation": volume_confirmation,
                 "head_shoulders": head_shoulders is not None,
                 "rsi": rsi_analysis.get("rsi"),
                 "rsi_zone": rsi_analysis.get("rsi_zone"),
-                "rsi_signal": rsi_analysis.get("rsi_signal")
+                "rsi_signal": rsi_analysis.get("rsi_signal"),
+                "atr": atr_value,
+                "ema_trend": ema.get("trend"),
+                "ema_cross": ema.get("ema_cross"),
+                "ema9": ema.get("ema9"),
+                "ema21": ema.get("ema21"),
+                "ema50": ema.get("ema50"),
+                "macd_signal": macd.get("macd_signal"),
+                "macd_divergence": macd.get("divergence"),
+                "macd_cross": macd.get("bearish_cross"),
             },
             "confidence": confidence,
             "test_trade": test_trade,
@@ -419,5 +498,5 @@ class SignalGenerator:
         current_volume = df.iloc[-1]["volume"]
         avg_volume = df["volume"].tail(20).mean()
         
-        return current_volume > avg_volume * 1.1
+        return current_volume > avg_volume * 1.5
 

@@ -1,5 +1,5 @@
 """Менеджер для работы с несколькими биржами."""
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
 
 import pandas as pd
 
@@ -104,4 +104,12 @@ class ExchangeManager:
         """Получает объем торгов."""
         parser = self._select_parser(asset, exchange)
         return parser.fetch_volume(asset, timeframe)
+
+    def get_funding_rate(self, asset: str) -> Optional[float]:
+        """Возвращает funding rate для крипто-фьючерса (только Binance)."""
+        parser = self.parsers.get("binance")
+        if parser is None:
+            return None
+        fetch = getattr(parser, "fetch_funding_rate", None)
+        return fetch(asset) if callable(fetch) else None
 

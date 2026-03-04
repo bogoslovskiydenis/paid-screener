@@ -48,6 +48,10 @@ except ImportError as e:
 logger = setup_logger(__name__)
 
 
+CRYPTO_ASSETS = {"ETH", "XRP", "SOL", "ADA", "NEAR", "BTC"}
+FUNDING_RATE_THRESHOLD = 0.0005  # 0.05% — граница перегрева
+
+
 def _btc_allows_buy(df: "pd.DataFrame", levels_analyzer: SupportResistanceAnalyzer) -> bool:
     """Фильтр: разрешать ли покупки по альтам исходя из BTC."""
     if df is None or df.empty or len(df) < 100:
@@ -133,6 +137,7 @@ def main():
         
         results = {}
         btc_buy_allowed_cache = {}
+        funding_rate_cache = {}
         
         # Обработка каждого актива и таймфрейма
         for asset in assets:
@@ -248,7 +253,7 @@ def main():
                             database.save_pattern(pattern_data)
                     
                     btc_buy_allowed = True
-                    if asset in ("ETH", "XRP", "SOL"):
+                    if asset in ("ETH", "XRP", "SOL", "ADA", "NEAR"):
                         if timeframe in btc_buy_allowed_cache:
                             btc_buy_allowed = btc_buy_allowed_cache[timeframe]
                         else:
@@ -259,12 +264,30 @@ def main():
                                 btc_df = None
                             btc_buy_allowed = _btc_allows_buy(btc_df, levels_analyzer)
                             btc_buy_allowed_cache[timeframe] = btc_buy_allowed
-                    
+
+                    # Funding rate фильтр (только для крипто, только 1 раз на таймфрейм)
+                    funding_rate = None
+                    if asset in CRYPTO_ASSETS:
+                        fr_cache_key = asset
+                        if fr_cache_key not in funding_rate_cache:
+                            funding_rate_cache[fr_cache_key] = exchange_manager.get_funding_rate(asset)
+                        funding_rate = funding_rate_cache[fr_cache_key]
+                        if funding_rate is not None:
+                            fr_sign = "+" if funding_rate >= 0 else ""
+                            print(f"  Funding Rate: {fr_sign}{funding_rate:.4%}")
+
                     # Генерация сигнала
                     signal = signal_generator.generate_signal(asset, timeframe, df)
                     if signal and signal.get("signal_type") == "BUY" and not btc_buy_allowed:
                         print("  Сигнал BUY заблокирован контекстом BTC")
                         signal = None
+                    if signal and funding_rate is not None:
+                        if signal.get("signal_type") == "BUY" and funding_rate > FUNDING_RATE_THRESHOLD:
+                            print(f"  Сигнал BUY заблокирован: funding rate перегрет ({funding_rate:+.4%})")
+                            signal = None
+                        elif signal.get("signal_type") == "SELL" and funding_rate < -FUNDING_RATE_THRESHOLD:
+                            print(f"  Сигнал SELL заблокирован: шорты перегреты по funding ({funding_rate:+.4%})")
+                            signal = None
                     if signal:
                         print(f"\n  ✓ СИГНАЛ: {signal['signal_type']} ({signal['strength']})")
                         print(f"    Уверенность: {signal['confidence']:.1%}")
@@ -275,6 +298,22 @@ def main():
                     else:
                         print("  Сигнал: не сгенерирован (низкая уверенность)")
                     
+                    from src.analytics.indicators.atr import ATRCalculator
+                    from src.analytics.indicators.ema import EMACalculator
+                    from src.analytics.indicators.macd import MACDCalculator
+                    _atr = ATRCalculator(period=14).get_current(df)
+                    _ema = EMACalculator(periods=[9, 21, 50]).analyze(df)
+                    _macd = MACDCalculator().analyze(df)
+
+                    if _atr:
+                        print(f"  ATR(14): {_atr:.4f}")
+                    ema_trend = _ema.get("trend", "NEUTRAL")
+                    ema_cross = _ema.get("ema_cross", "NEUTRAL")
+                    print(f"  EMA тренд: {ema_trend}, EMA9/21: {ema_cross}")
+                    macd_sig = _macd.get("macd_signal", "NEUTRAL")
+                    macd_div = _macd.get("divergence")
+                    print(f"  MACD: {macd_sig}" + (f", дивергенция: {macd_div}" if macd_div else ""))
+
                     result_data = {
                         "current_price": float(df.iloc[-1]['close']),
                         "candles_count": len(df),
@@ -283,6 +322,10 @@ def main():
                         "levels": levels,
                         "head_shoulders_pattern": hs_pattern,
                         "chart_patterns": chart_patterns if chart_patterns else None,
+                        "atr": _atr,
+                        "ema": _ema,
+                        "macd": _macd,
+                        "funding_rate": funding_rate,
                         "signal": signal
                     }
                     

@@ -1,7 +1,7 @@
 """Парсер для Binance."""
 import pandas as pd
 import time
-from typing import Optional
+from typing import Optional, Any, Dict
 from .base import BaseParser
 from ..utils.retry import retry_with_backoff
 
@@ -63,4 +63,14 @@ class BinanceParser(BaseParser):
         symbol = self.normalize_symbol(symbol)
         ticker = self.exchange.fetch_ticker(symbol)
         return ticker.get("quoteVolume", 0.0)
+
+    def fetch_funding_rate(self, asset: str) -> Optional[float]:
+        """Возвращает текущий funding rate для perpetual фьючерса."""
+        try:
+            symbol = f"{asset}/USDT:USDT"
+            data = self.exchange.fetch_funding_rate(symbol)
+            rate = data.get("fundingRate")
+            return float(rate) if rate is not None else None
+        except Exception:
+            return None
 

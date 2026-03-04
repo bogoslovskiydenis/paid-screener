@@ -2,6 +2,7 @@
 """Простой Telegram-бот для отправки сигналов BUY из JSON-файла."""
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -10,6 +11,31 @@ from typing import Any, Dict, List, Optional, Set
 import requests
 
 TELEGRAM_BOT_TOKEN = "8339654755:AAFa4GbSyOk5rvtlw4RZY3h7l2M_4pyKxns"
+
+
+SENT_SIGNALS_PATH = Path("data/sent_signals.json")
+
+
+def _signal_key(asset: str, timeframe: str, entry_price: float) -> str:
+    raw = f"{asset}:{timeframe}:{entry_price:.6f}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def load_sent_keys(path: Path) -> Set[str]:
+    if not path.exists():
+        return set()
+    with path.open("r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            return set()
+    return set(data) if isinstance(data, list) else set()
+
+
+def save_sent_keys(path: Path, keys: Set[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(sorted(keys), f, ensure_ascii=False)
 
 
 def load_signals(path: Path) -> Dict[str, Any]:
@@ -104,6 +130,8 @@ def collect_buy_signals(
                     continue
 
             test_trade = signal.get("test_trade") or None
+            indicators = signal.get("indicators") or {}
+            atr = indicators.get("atr")
 
             results.append(
                 {
@@ -116,6 +144,7 @@ def collect_buy_signals(
                     "take_profit": signal.get("take_profit", []),
                     "confidence": confidence,
                     "test_trade": test_trade,
+                    "atr": float(atr) if atr is not None else None,
                 }
             )
 
@@ -356,11 +385,21 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
         print("Нет сигналов, удовлетворяющих фильтрам.")
         return
 
+    sent_keys = load_sent_keys(SENT_SIGNALS_PATH)
+    new_signals = [
+        s for s in filtered_signals
+        if _signal_key(s["asset"], s["timeframe"], s["entry_price"]) not in sent_keys
+    ]
+
+    if not new_signals:
+        print("Все сигналы уже были отправлены ранее.")
+        return
+
     # сохраняем активные сигналы для последующего трекинга TP/SL
     active_signals_path = Path("data/active_signals.json")
-    save_active_signals(active_signals_path, filtered_signals)
+    save_active_signals(active_signals_path, new_signals)
 
-    message = build_message(filtered_signals)
+    message = build_message(new_signals)
 
     sent = 0
     for chat_id in subscribers:
@@ -370,7 +409,12 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
         except Exception as exc:
             print(f"Ошибка отправки подписчику {chat_id}: {exc}")
 
-    print(f"Отправлено {len(filtered_signals)} сигналов {sent} подписчикам.")
+    if sent > 0:
+        for s in new_signals:
+            sent_keys.add(_signal_key(s["asset"], s["timeframe"], s["entry_price"]))
+        save_sent_keys(SENT_SIGNALS_PATH, sent_keys)
+
+    print(f"Отправлено {len(new_signals)} сигналов {sent} подписчикам.")
 
 
 def parse_args() -> argparse.Namespace:

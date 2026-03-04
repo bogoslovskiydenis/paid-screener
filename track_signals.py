@@ -19,6 +19,9 @@ ACTIVE_SIGNALS_PATH = Path("data/active_signals.json")
 SUBSCRIBERS_PATH = Path("data/telegram_subscribers.json")
 STATS_PATH = Path("data/trade_stats.json")
 
+# Только эти активы отслеживаем — остальные (акции) пропускаем
+BINANCE_ASSETS = {"ETH", "SOL", "ADA", "NEAR", "XRP"}
+
 
 def load_active_signals(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
@@ -81,6 +84,28 @@ def get_tp_level(signal: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def get_trail_distance(signal: Dict[str, Any]) -> float:
+    """ATR × 1.5, иначе 2% от цены входа."""
+    atr = signal.get("atr")
+    if atr and float(atr) > 0:
+        return float(atr) * 1.5
+    return float(signal.get("entry_price", 0)) * 0.02
+
+
+def calc_trailed_sl(signal: Dict[str, Any], best_price: float) -> float:
+    """Вычисляет текущий trailing SL — только в сторону прибыли."""
+    side = str(signal.get("signal_type") or "").upper()
+    original_sl = float(signal.get("stop_loss"))
+    dist = get_trail_distance(signal)
+
+    if side == "BUY":
+        # SL подтягивается вверх, но никогда не опускается
+        return max(original_sl, best_price - dist)
+    else:
+        # SL подтягивается вниз, но никогда не поднимается
+        return min(original_sl, best_price + dist)
+
+
 def check_hit(
     price_high: float,
     price_low: float,
@@ -97,10 +122,11 @@ def check_hit(
         hit_sl = price_high >= sl_level
         hit_tp = price_low <= tp_level
 
-    if hit_tp:
-        return "TP", tp_level
+    # SL приоритет: если оба задеты на одной свече — считаем убыток
     if hit_sl:
         return "SL", sl_level
+    if hit_tp:
+        return "TP", tp_level
     return None, None
 
 
@@ -127,10 +153,15 @@ def build_result_message(
         strength_ru = "СРЕДНИЙ"
 
     direction_text = "SELL" if side == "SELL" else "BUY"
+    result_label = {
+        "TP": "TP ✅",
+        "TSL": "Trailing Stop ✅",
+        "SL": "SL ❌",
+    }.get(result, result)
 
     base = (
         f"Сделка по сигналу {asset} {timeframe} {direction_text} "
-        f"достигла {result} по цене {price:.4f} {f'({strength_ru})' if strength_ru else ''}"
+        f"закрыта по {result_label} по цене {price:.4f} {f'({strength_ru})' if strength_ru else ''}"
     )
 
     if test_pnl_usd is not None and risk_usd:
@@ -144,7 +175,7 @@ def build_result_message(
 
 
 def track_signals(interval_seconds: int = 60) -> None:
-    exchange_manager = ExchangeManager()
+    exchange_manager = ExchangeManager(["binance"])
     subscribers = load_subscribers(SUBSCRIBERS_PATH)
     if not subscribers:
         print("Подписчиков нет, отслеживать некому.")
@@ -175,12 +206,22 @@ def track_signals(interval_seconds: int = 60) -> None:
                 updated_signals.append(signal)
                 continue
 
+            # Акции не отслеживаем — только Binance крипто
+            if asset.upper() not in BINANCE_ASSETS:
+                updated_signals.append(signal)
+                continue
+
             tp_level = get_tp_level(signal)
             if tp_level is None:
                 updated_signals.append(signal)
                 continue
 
-            sl_level = float(signal.get("stop_loss"))
+            entry_price = float(signal.get("entry_price"))
+            side = signal_type.upper()
+
+            # Инициализируем best_price при первом цикле
+            if "best_price" not in signal:
+                signal["best_price"] = entry_price
 
             try:
                 df = exchange_manager.get_ohlcv(asset, timeframe, limit=1)
@@ -200,13 +241,39 @@ def track_signals(interval_seconds: int = 60) -> None:
             price_high = float(last["high"])
             price_low = float(last["low"])
 
+            # Обновляем best_price в сторону прибыли
+            prev_best = float(signal["best_price"])
+            if side == "BUY":
+                signal["best_price"] = max(prev_best, price_high)
+            else:
+                signal["best_price"] = min(prev_best, price_low)
+
+            # Рассчитываем trailing SL
+            trailed_sl = calc_trailed_sl(signal, float(signal["best_price"]))
+            prev_trailed = signal.get("trailed_sl")
+            signal["trailed_sl"] = trailed_sl
+
+            # Логируем движение SL
+            if prev_trailed is None or abs(trailed_sl - float(prev_trailed)) > 0.0001:
+                move_pct = (trailed_sl - entry_price) / entry_price * 100
+                print(f"  TSL {asset} {timeframe}: SL → {trailed_sl:.4f} ({move_pct:+.2f}% от входа)")
+
             result, price = check_hit(
                 price_high=price_high,
                 price_low=price_low,
                 signal_type=signal_type,
                 tp_level=tp_level,
-                sl_level=sl_level,
+                sl_level=trailed_sl,
             )
+
+            # Если SL сработал в прибыли — это TSL (победа), не обычный SL
+            if result == "SL":
+                if side == "BUY" and trailed_sl > entry_price:
+                    result = "TSL"
+                    price = trailed_sl
+                elif side == "SELL" and trailed_sl < entry_price:
+                    result = "TSL"
+                    price = trailed_sl
 
             if result is None or price is None:
                 updated_signals.append(signal)
@@ -233,9 +300,9 @@ def track_signals(interval_seconds: int = 60) -> None:
                 signal["test_pnl_usd"] = test_pnl_usd
                 signal["test_pnl_rr"] = test_pnl_rr
 
-            # обновляем статистику успешности
+            # обновляем статистику успешности (TSL = победа)
             total_closed += 1
-            if result == "TP":
+            if result in ("TP", "TSL"):
                 wins += 1
             elif result == "SL":
                 losses += 1
@@ -277,7 +344,9 @@ def track_signals(interval_seconds: int = 60) -> None:
 
             updated_signals.append(signal)
 
-        save_active_signals(ACTIVE_SIGNALS_PATH, updated_signals)
+        # оставляем только незакрытые сигналы
+        open_signals = [s for s in updated_signals if s.get("status") not in {"TP", "SL", "TSL"}]
+        save_active_signals(ACTIVE_SIGNALS_PATH, open_signals)
         save_stats(STATS_PATH, stats)
         time.sleep(interval_seconds)
 
