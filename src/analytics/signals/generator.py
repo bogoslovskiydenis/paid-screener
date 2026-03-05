@@ -76,6 +76,7 @@ class SignalGenerator:
             atr_value=atr_value,
             ema_analysis=ema_analysis,
             macd_analysis=macd_analysis,
+            timeframe=timeframe,
         )
         
         if not signal_data or signal_data["confidence"] < self.min_confidence:
@@ -92,6 +93,15 @@ class SignalGenerator:
         
         return signal_data
     
+    # Максимальное расстояние до TP в зависимости от таймфрейма
+    _MAX_TP_PCT: Dict[str, float] = {
+        "5m":  0.015,
+        "15m": 0.025,
+        "1h":  0.05,
+        "4h":  0.10,
+        "1d":  0.20,
+    }
+
     def _evaluate_signals(
         self,
         df: pd.DataFrame,
@@ -104,6 +114,7 @@ class SignalGenerator:
         atr_value: Optional[float] = None,
         ema_analysis: Optional[Dict[str, Any]] = None,
         macd_analysis: Optional[Dict[str, Any]] = None,
+        timeframe: str = "",
     ) -> Optional[Dict[str, Any]]:
         """Оценивает сигналы и определяет тип."""
         buy_score = 0.0
@@ -214,17 +225,21 @@ class SignalGenerator:
         buy_score = min(buy_score, 1.0)
         sell_score = min(sell_score, 1.0)
 
+        max_tp_pct = self._MAX_TP_PCT.get(timeframe, 0.20)
+
         if buy_score > sell_score and buy_score > 0.6:
             return self._create_buy_signal(
                 df, current_price, buy_score, buy_factors,
                 levels, head_shoulders, volume_confirmation, rsi_analysis,
                 atr_value=atr_value, ema_analysis=ema_analysis, macd_analysis=macd_analysis,
+                max_tp_pct=max_tp_pct,
             )
         elif sell_score > buy_score and sell_score > 0.6:
             return self._create_sell_signal(
                 df, current_price, sell_score, sell_factors,
                 levels, head_shoulders, volume_confirmation, rsi_analysis,
                 atr_value=atr_value, ema_analysis=ema_analysis, macd_analysis=macd_analysis,
+                max_tp_pct=max_tp_pct,
             )
         
         return None
@@ -275,6 +290,7 @@ class SignalGenerator:
         atr_value: Optional[float] = None,
         ema_analysis: Optional[Dict[str, Any]] = None,
         macd_analysis: Optional[Dict[str, Any]] = None,
+        max_tp_pct: float = 0.20,
     ) -> Optional[Dict[str, Any]]:
         """Создает сигнал на покупку."""
         support_levels = levels.get("support_levels", [])
@@ -289,29 +305,25 @@ class SignalGenerator:
             if nearest_support:
                 stop_loss = nearest_support["price"] * 0.995
 
+        tp_max = current_price * (1 + max_tp_pct)
         take_profit = []
         if resistance_levels:
             for i, res in enumerate(resistance_levels[:2]):
-                if res["price"] > current_price:
+                if current_price < res["price"] <= tp_max:
                     take_profit.append({
                         "level": res["price"],
                         "probability": 0.7 - i * 0.2
                     })
         
         if head_shoulders and head_shoulders.get("target_price"):
-            take_profit.append({
-                "level": head_shoulders["target_price"],
-                "probability": 0.6
-            })
+            target = head_shoulders["target_price"]
+            if current_price < target <= tp_max:
+                take_profit.append({"level": target, "probability": 0.6})
 
-        filtered_tp = []
-        for tp in take_profit:
-            level = tp.get("level")
-            if isinstance(level, (int, float)) and level > current_price:
-                filtered_tp.append(tp)
+        filtered_tp = [tp for tp in take_profit if isinstance(tp.get("level"), (int, float)) and tp["level"] > current_price]
 
         if not filtered_tp:
-            filtered_tp = [{"level": current_price * 1.05, "probability": 0.7}]
+            filtered_tp = [{"level": min(current_price * 1.05, tp_max), "probability": 0.7}]
         
         if not self._is_risk_reward_acceptable(
             entry_price=entry_price,
@@ -389,6 +401,7 @@ class SignalGenerator:
         atr_value: Optional[float] = None,
         ema_analysis: Optional[Dict[str, Any]] = None,
         macd_analysis: Optional[Dict[str, Any]] = None,
+        max_tp_pct: float = 0.20,
     ) -> Optional[Dict[str, Any]]:
         """Создает сигнал на продажу."""
         support_levels = levels.get("support_levels", [])
@@ -402,30 +415,26 @@ class SignalGenerator:
                                      key=lambda x: x["price"], default=None)
             if nearest_resistance:
                 stop_loss = nearest_resistance["price"] * 1.005
-        
+
+        tp_min = current_price * (1 - max_tp_pct)
         take_profit = []
         if support_levels:
             for i, sup in enumerate(support_levels[:2]):
-                if sup["price"] < current_price:
+                if tp_min <= sup["price"] < current_price:
                     take_profit.append({
                         "level": sup["price"],
                         "probability": 0.7 - i * 0.2
                     })
         
         if head_shoulders and head_shoulders.get("target_price"):
-            take_profit.append({
-                "level": head_shoulders["target_price"],
-                "probability": 0.6
-            })
+            target = head_shoulders["target_price"]
+            if tp_min <= target < current_price:
+                take_profit.append({"level": target, "probability": 0.6})
 
-        filtered_tp = []
-        for tp in take_profit:
-            level = tp.get("level")
-            if isinstance(level, (int, float)) and level < current_price:
-                filtered_tp.append(tp)
+        filtered_tp = [tp for tp in take_profit if isinstance(tp.get("level"), (int, float)) and tp["level"] < current_price]
 
         if not filtered_tp:
-            filtered_tp = [{"level": current_price * 0.95, "probability": 0.7}]
+            filtered_tp = [{"level": max(current_price * 0.95, tp_min), "probability": 0.7}]
         
         if not self._is_risk_reward_acceptable(
             entry_price=entry_price,

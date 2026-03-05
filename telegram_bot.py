@@ -84,7 +84,13 @@ def collect_buy_signals(
 
             strength = str(signal.get("strength") or "").upper()
             confidence = float(signal.get("confidence", 0.0))
-            if confidence < min_confidence:
+
+            # для SELL на коротких TF — повышенный порог confidence
+            min_conf_effective = min_confidence
+            if signal_type == "SELL" and timeframe in ("5m", "15m"):
+                min_conf_effective = max(min_confidence, 0.75)
+
+            if confidence < min_conf_effective:
                 continue
 
             if strength not in ("MEDIUM", "STRONG"):
@@ -93,41 +99,64 @@ def collect_buy_signals(
             rsi_info = tf_data.get("rsi") or {}
             rsi_value = rsi_info.get("rsi")
             if isinstance(rsi_value, (int, float)):
-                if signal_type == "SELL" and rsi_value < 30:
+                # для SELL требуем RSI > 55: актив должен быть перекуплен, прежде чем шортить
+                if signal_type == "SELL" and rsi_value < 55:
                     continue
                 if signal_type == "BUY" and rsi_value > 70:
                     continue
 
-            if timeframe == "1h" and signal_type == "SELL":
-                tf_15m = tf_map.get("15m") or {}
-                tf_4h = tf_map.get("4h") or {}
+            if signal_type == "SELL":
+                indicators = signal.get("indicators") or {}
+                ema_trend = str(indicators.get("ema_trend") or "").upper()
 
-                sig_15m = tf_15m.get("signal") or {}
-                sig_15m_type = sig_15m.get("signal_type")
-                sig_15m_strength = str(sig_15m.get("strength") or "").upper()
-                sig_15m_conf = float(sig_15m.get("confidence", 0.0))
+                if timeframe in ("5m", "15m"):
+                    # не шортим в бычьем тренде на коротких TF
+                    if ema_trend == "BULLISH":
+                        continue
 
-                has_valid_15m_sell = (
-                    sig_15m_type == "SELL"
-                    and sig_15m_strength in ("MEDIUM", "STRONG")
-                    and sig_15m_conf >= min_confidence
-                )
+                if timeframe == "15m":
+                    sig_1h = (tf_map.get("1h") or {}).get("signal") or {}
+                    if sig_1h.get("signal_type") == "BUY":
+                        continue
+                    sig_4h = (tf_map.get("4h") or {}).get("signal") or {}
+                    if sig_4h.get("signal_type") == "BUY":
+                        continue
 
-                if not has_valid_15m_sell:
-                    continue
+                elif timeframe == "5m":
+                    sig_15m = (tf_map.get("15m") or {}).get("signal") or {}
+                    if sig_15m.get("signal_type") != "SELL":
+                        continue
 
-                tf_4h_patterns = tf_4h.get("chart_patterns") or []
-                has_bullish_4h_pattern = any(
-                    isinstance(p, dict)
-                    and str(p.get("pattern_direction") or "").upper() == "BULLISH"
-                    for p in tf_4h_patterns
-                )
+                elif timeframe == "1h":
+                    tf_15m = tf_map.get("15m") or {}
+                    tf_4h = tf_map.get("4h") or {}
 
-                sig_4h = tf_4h.get("signal") or {}
-                has_bearish_4h_signal = sig_4h.get("signal_type") == "SELL"
+                    sig_15m = tf_15m.get("signal") or {}
+                    sig_15m_type = sig_15m.get("signal_type")
+                    sig_15m_strength = str(sig_15m.get("strength") or "").upper()
+                    sig_15m_conf = float(sig_15m.get("confidence", 0.0))
 
-                if has_bullish_4h_pattern and not has_bearish_4h_signal and strength != "STRONG":
-                    continue
+                    has_valid_15m_sell = (
+                        sig_15m_type == "SELL"
+                        and sig_15m_strength in ("MEDIUM", "STRONG")
+                        and sig_15m_conf >= min_confidence
+                    )
+
+                    if not has_valid_15m_sell:
+                        continue
+
+                    tf_4h_patterns = tf_4h.get("chart_patterns") or []
+                    has_bullish_4h_pattern = any(
+                        isinstance(p, dict)
+                        and str(p.get("pattern_direction") or "").upper() == "BULLISH"
+                        for p in tf_4h_patterns
+                    )
+
+                    sig_4h = tf_4h.get("signal") or {}
+                    has_bearish_4h_signal = sig_4h.get("signal_type") == "SELL"
+
+                    if has_bullish_4h_pattern and not has_bearish_4h_signal and strength != "STRONG":
+                        continue
 
             test_trade = signal.get("test_trade") or None
             indicators = signal.get("indicators") or {}
@@ -145,6 +174,10 @@ def collect_buy_signals(
                     "confidence": confidence,
                     "test_trade": test_trade,
                     "atr": float(atr) if atr is not None else None,
+                    "rsi": indicators.get("rsi"),
+                    "rsi_zone": indicators.get("rsi_zone"),
+                    "ema_trend": indicators.get("ema_trend"),
+                    "macd_signal": indicators.get("macd_signal"),
                 }
             )
 
@@ -181,8 +214,8 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
         tp_list = s.get("take_profit", []) or []
 
         primary_tp_level = None
+        primary_rr: Optional[float] = None
 
-        rr_values: List[float] = []
         for tp in tp_list:
             if not isinstance(tp, dict):
                 continue
@@ -191,19 +224,19 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
                 continue
             if primary_tp_level is None:
                 primary_tp_level = float(level)
-            if s.get("signal_type") == "BUY":
-                reward = level - entry
-                risk = entry - sl
-            else:
-                reward = entry - level
-                risk = sl - entry
-            if risk > 0 and reward > 0:
-                rr_values.append(reward / risk)
+                if s.get("signal_type") == "BUY":
+                    reward = level - entry
+                    risk = entry - sl
+                else:
+                    reward = entry - level
+                    risk = sl - entry
+                if risk > 0 and reward > 0:
+                    primary_rr = reward / risk
+                break
 
         rr_text = ""
-        if rr_values:
-            best_rr = max(rr_values)
-            rr_text = f"R/R: {best_rr:.2f}"
+        if primary_rr is not None:
+            rr_text = f"R/R (к TP1): {primary_rr:.2f}"
         tp_levels = ", ".join(
             f"{tp.get('level'):.4f} (p={tp.get('probability', 0):.2f})"
             for tp in s.get("take_profit", [])
@@ -245,6 +278,28 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
             lines.append(rr_text)
         if tp_levels:
             lines.append(f"TP: {tp_levels}")
+
+        # контекст: RSI, EMA тренд, MACD
+        ctx_parts = []
+        rsi_val = s.get("rsi")
+        rsi_zone = str(s.get("rsi_zone") or "").upper()
+        if isinstance(rsi_val, (int, float)):
+            rsi_zone_ru = {"OVERBOUGHT": "перекуплен", "OVERSOLD": "перепродан"}.get(rsi_zone, "нейтрален")
+            ctx_parts.append(f"RSI {rsi_val:.1f} ({rsi_zone_ru})")
+
+        ema_trend = str(s.get("ema_trend") or "").upper()
+        if ema_trend in ("BULLISH", "BEARISH"):
+            ema_ru = "тренд ▲" if ema_trend == "BULLISH" else "тренд ▼"
+            ctx_parts.append(f"EMA {ema_ru}")
+
+        macd_sig = str(s.get("macd_signal") or "").upper()
+        if macd_sig in ("BUY", "SELL"):
+            macd_ru = "бычий" if macd_sig == "BUY" else "медвежий"
+            ctx_parts.append(f"MACD {macd_ru}")
+
+        if ctx_parts:
+            lines.append("📊 " + " | ".join(ctx_parts))
+
         lines.append("")
 
     return "\n".join(lines).strip()

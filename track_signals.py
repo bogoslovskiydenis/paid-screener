@@ -20,7 +20,7 @@ SUBSCRIBERS_PATH = Path("data/telegram_subscribers.json")
 STATS_PATH = Path("data/trade_stats.json")
 
 # Только эти активы отслеживаем — остальные (акции) пропускаем
-BINANCE_ASSETS = {"ETH", "SOL"}
+BINANCE_ASSETS = {"ETH", "SOL", "BTC"}
 
 
 def load_active_signals(path: Path) -> List[Dict[str, Any]]:
@@ -93,16 +93,22 @@ def get_trail_distance(signal: Dict[str, Any]) -> float:
 
 
 def calc_trailed_sl(signal: Dict[str, Any], best_price: float) -> float:
-    """Вычисляет текущий trailing SL — только в сторону прибыли."""
+    """Trailing SL активируется только после прохождения 1R в сторону прибыли."""
     side = str(signal.get("signal_type") or "").upper()
+    entry = float(signal.get("entry_price"))
     original_sl = float(signal.get("stop_loss"))
     dist = get_trail_distance(signal)
+    risk = abs(entry - original_sl)
 
     if side == "BUY":
-        # SL подтягивается вверх, но никогда не опускается
+        # Начинаем тянуть только когда цена прошла хотя бы 1R вверх
+        if best_price < entry + risk:
+            return original_sl
         return max(original_sl, best_price - dist)
     else:
-        # SL подтягивается вниз, но никогда не поднимается
+        # Начинаем тянуть только когда цена прошла хотя бы 1R вниз
+        if best_price > entry - risk:
+            return original_sl
         return min(original_sl, best_price + dist)
 
 

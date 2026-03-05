@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from src.utils.config import load_config
 
 
-CRYPTO_ASSETS: List[str] = ["ETH"]
+CRYPTO_ASSETS: List[str] = ["ETH", "SOL", "BTC"]
 STOCK_ASSETS: List[str] = [
     "MU",
     "SNDK",
