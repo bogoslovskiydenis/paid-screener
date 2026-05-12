@@ -1,42 +1,20 @@
 assets:
-  - ETH
-  - SOL
-  - MU
-  - SNDK
-  - LITE
-  - TSM
-  - GOOGL
-  - GOOG
-  - ASML
-  - AMD
-  - AMZN
-  - PLTR
-  - MRVL
-  - AVGO
-  - FXI
-  - NFLX
-  - META
-  - NVDA
-  - MSFT
-  - IWM
-  - QQQ
-  - SPY
-  - XLF
-  - AAPL
-  - DIA
-  - XLP
-  - GLD
-  - XOP
-  - SLV
-  - USO
-  - TSLA
+  - ETH      # ETH/USDT спот
+  - SOL      # SOL/USDT спот (то же самое, что пара SOL/USDT на Binance)
+  - BTC      # BTC/USDT спот
+  - BNB      # BNB/USDT спот — высокая ликвидность, бета к бирже
+  - XLM      # XLM/USDT спот
+  - "ETH/BTC"
+  - "SOL/ETH"
+  - "SOL/BTC"
+  - "XLM/BTC"  # кросс XLM к BTC (спот)
 
 timeframes:
-  - 5m
-  - 15m
-  - 1h
   - 4h
   - 1d
+  - 3d
+  - 1w
+  - 1M
 
 exchanges:
   binance:
@@ -48,9 +26,6 @@ exchanges:
   okx:
     enabled: true
     rate_limit: 20
-  investing:
-    enabled: true
-    rate_limit: 120
 
 database:
   type: sqlite

@@ -69,7 +69,7 @@ class SupportResistanceAnalyzer:
                 })
         
         levels.sort(key=lambda x: x["strength"], reverse=True)
-        return levels[:5]
+        return levels[:15]
     
     def _find_support_levels(
         self,
@@ -100,7 +100,7 @@ class SupportResistanceAnalyzer:
                 })
         
         levels.sort(key=lambda x: x["strength"], reverse=True)
-        return levels[:5]
+        return levels[:15]
     
     def check_breakout(
         self,

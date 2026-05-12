@@ -1,6 +1,3 @@
-"""Paid Screener - система анализа криптовалютных графиков."""
-from .main import PaidScreener, main
+"""Paid Screener — подмодули импортируйте явно (например `from src.main import main`)."""
 
-__all__ = ["PaidScreener", "main"]
 __version__ = "1.0.0"
-

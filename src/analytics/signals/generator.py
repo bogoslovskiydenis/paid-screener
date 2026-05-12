@@ -100,6 +100,9 @@ class SignalGenerator:
         "1h":  0.05,
         "4h":  0.10,
         "1d":  0.20,
+        "3d":  0.25,
+        "1w":  0.30,
+        "1M":  0.40,
     }
 
     def _evaluate_signals(
@@ -308,7 +311,7 @@ class SignalGenerator:
         tp_max = current_price * (1 + max_tp_pct)
         take_profit = []
         if resistance_levels:
-            for i, res in enumerate(resistance_levels[:2]):
+            for i, res in enumerate(resistance_levels[:8]):
                 if current_price < res["price"] <= tp_max:
                     take_profit.append({
                         "level": res["price"],
@@ -359,6 +362,19 @@ class SignalGenerator:
         ema = ema_analysis or {}
         macd = macd_analysis or {}
 
+        ns_below = max(
+            (s for s in support_levels if s["price"] < current_price),
+            key=lambda x: x["price"],
+            default=None,
+        )
+        nr_above = min(
+            (r for r in resistance_levels if r["price"] > current_price),
+            key=lambda x: x["price"],
+            default=None,
+        )
+        sup_display = float(ns_below["price"]) if ns_below else None
+        res_display = float(nr_above["price"]) if nr_above else None
+
         return {
             "signal_type": "BUY",
             "strength": strength,
@@ -367,8 +383,8 @@ class SignalGenerator:
             "take_profit": filtered_tp,
             "indicators": {
                 "candlestick_pattern": cs_factor,
-                "support_level": support_levels[0]["price"] if support_levels else None,
-                "resistance_level": resistance_levels[0]["price"] if resistance_levels else None,
+                "support_level": sup_display,
+                "resistance_level": res_display,
                 "volume_confirmation": volume_confirmation,
                 "head_shoulders": head_shoulders is not None,
                 "rsi": rsi_analysis.get("rsi"),
@@ -419,7 +435,7 @@ class SignalGenerator:
         tp_min = current_price * (1 - max_tp_pct)
         take_profit = []
         if support_levels:
-            for i, sup in enumerate(support_levels[:2]):
+            for i, sup in enumerate(support_levels[:8]):
                 if tp_min <= sup["price"] < current_price:
                     take_profit.append({
                         "level": sup["price"],
@@ -470,6 +486,19 @@ class SignalGenerator:
         ema = ema_analysis or {}
         macd = macd_analysis or {}
 
+        ns_below = max(
+            (s for s in support_levels if s["price"] < current_price),
+            key=lambda x: x["price"],
+            default=None,
+        )
+        nr_above = min(
+            (r for r in resistance_levels if r["price"] > current_price),
+            key=lambda x: x["price"],
+            default=None,
+        )
+        sup_display = float(ns_below["price"]) if ns_below else None
+        res_display = float(nr_above["price"]) if nr_above else None
+
         return {
             "signal_type": "SELL",
             "strength": strength,
@@ -478,8 +507,8 @@ class SignalGenerator:
             "take_profit": filtered_tp,
             "indicators": {
                 "candlestick_pattern": cs_factor,
-                "support_level": support_levels[0]["price"] if support_levels else None,
-                "resistance_level": resistance_levels[0]["price"] if resistance_levels else None,
+                "support_level": sup_display,
+                "resistance_level": res_display,
                 "volume_confirmation": volume_confirmation,
                 "head_shoulders": head_shoulders is not None,
                 "rsi": rsi_analysis.get("rsi"),

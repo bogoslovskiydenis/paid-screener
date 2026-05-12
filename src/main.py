@@ -224,7 +224,7 @@ def main():
     """Главная функция."""
     parser = argparse.ArgumentParser(description="Paid Screener - криптовалютная аналитика")
     parser.add_argument("--asset", type=str, help="Актив для анализа (ETH, SOL)")
-    parser.add_argument("--timeframes", type=str, help="Таймфреймы через запятую (15m,4h,1d,1M)")
+    parser.add_argument("--timeframes", type=str, help="Таймфреймы через запятую (4h,1d,3d,1w,1M)")
     parser.add_argument("--min-confidence", type=float, help="Минимальная уверенность сигнала")
     parser.add_argument("--export-json", action="store_true", help="Экспортировать результаты в JSON")
     parser.add_argument("--output", type=str, default="signals.json", help="Путь для экспорта JSON")

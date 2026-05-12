@@ -1,5 +1,5 @@
 """Модуль для работы с базой данных."""
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean, JSON
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean, JSON, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime
@@ -78,6 +78,30 @@ class Signal(Base):
     confidence = Column(Float, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     test_trade = Column(JSON, nullable=True)
+
+
+class Trade(Base):
+    """Закрытая сделка (журнал для анализа)."""
+    __tablename__ = "trades"
+
+    id = Column(Integer, primary_key=True)
+    asset = Column(String, nullable=False, index=True)
+    timeframe = Column(String, nullable=False, index=True)
+    signal_type = Column(String, nullable=False)
+    strength = Column(String, nullable=True)
+    entry_price = Column(Float, nullable=False)
+    exit_price = Column(Float, nullable=False)
+    result = Column(String, nullable=False)
+    confidence = Column(Float, nullable=True)
+    risk_usd = Column(Float, nullable=True)
+    qty = Column(Float, nullable=True)
+    pnl_usd = Column(Float, nullable=True)
+    pnl_rr = Column(Float, nullable=True)
+    opened_at = Column(DateTime, nullable=True, index=True)
+    closed_at = Column(DateTime, nullable=False, index=True)
+    source = Column(String, nullable=False, default="tracker")
+    notes = Column(Text, nullable=True)
+    signal_snapshot = Column(JSON, nullable=True)
 
 
 class Breakout(Base):
@@ -255,6 +279,104 @@ class Database:
             session.rollback()
             logger.error(f"Error saving breakout: {e}")
             raise
+        finally:
+            session.close()
+
+    def save_trade(self, trade_data: Dict[str, Any]) -> int:
+        """Сохраняет закрытую сделку в журнал."""
+        session = self.get_session()
+        try:
+            import numpy as np
+
+            def _json_safe(obj: Any) -> Any:
+                if isinstance(obj, dict):
+                    return {k: _json_safe(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_json_safe(v) for v in obj]
+                if isinstance(obj, datetime):
+                    return obj.isoformat()
+                if isinstance(obj, (np.integer, np.floating)):
+                    return float(obj) if isinstance(obj, np.floating) else int(obj)
+                if isinstance(obj, (bool, np.bool_)):
+                    return bool(obj)
+                return obj
+
+            data = dict(trade_data)
+            snap = data.pop("signal_snapshot", None)
+            if snap is not None:
+                snap = _json_safe(snap)
+
+            closed_at = data.pop("closed_at", None) or datetime.utcnow()
+            trade = Trade(
+                asset=data["asset"],
+                timeframe=data["timeframe"],
+                signal_type=data["signal_type"],
+                strength=data.get("strength"),
+                entry_price=float(data["entry_price"]),
+                exit_price=float(data["exit_price"]),
+                result=data["result"],
+                confidence=data.get("confidence"),
+                risk_usd=data.get("risk_usd"),
+                qty=data.get("qty"),
+                pnl_usd=data.get("pnl_usd"),
+                pnl_rr=data.get("pnl_rr"),
+                opened_at=data.get("opened_at"),
+                closed_at=closed_at,
+                source=data.get("source") or "tracker",
+                notes=data.get("notes"),
+                signal_snapshot=snap,
+            )
+            session.add(trade)
+            session.commit()
+            tid = int(trade.id)
+            logger.info(f"Trade saved: id={tid} {trade.asset} {trade.result}")
+            return tid
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error saving trade: {e}")
+            raise
+        finally:
+            session.close()
+
+    def get_trades(
+        self,
+        asset: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Возвращает закрытые сделки (новые первые)."""
+        session = self.get_session()
+        try:
+            q = session.query(Trade).order_by(Trade.closed_at.desc())
+            if asset:
+                q = q.filter(Trade.asset == asset)
+            if limit:
+                q = q.limit(limit)
+            rows = q.all()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": r.id,
+                        "asset": r.asset,
+                        "timeframe": r.timeframe,
+                        "signal_type": r.signal_type,
+                        "strength": r.strength,
+                        "entry_price": r.entry_price,
+                        "exit_price": r.exit_price,
+                        "result": r.result,
+                        "confidence": r.confidence,
+                        "risk_usd": r.risk_usd,
+                        "qty": r.qty,
+                        "pnl_usd": r.pnl_usd,
+                        "pnl_rr": r.pnl_rr,
+                        "opened_at": r.opened_at.isoformat() if r.opened_at else None,
+                        "closed_at": r.closed_at.isoformat() if r.closed_at else None,
+                        "source": r.source,
+                        "notes": r.notes,
+                        "signal_snapshot": r.signal_snapshot,
+                    }
+                )
+            return out
         finally:
             session.close()
 

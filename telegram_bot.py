@@ -2,9 +2,10 @@
 """Простой Telegram-бот для отправки сигналов BUY из JSON-файла."""
 
 import argparse
-import hashlib
 import json
+import math
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -13,29 +14,41 @@ import requests
 TELEGRAM_BOT_TOKEN = "8339654755:AAFa4GbSyOk5rvtlw4RZY3h7l2M_4pyKxns"
 
 
-SENT_SIGNALS_PATH = Path("data/sent_signals.json")
+TELEGRAM_DAILY_SENDS_PATH = Path("data/telegram_daily_sends.json")
+
+MAX_SIGNAL_SENDS_PER_DAY = 2
+MIN_SIGNAL_CONFIDENCE_REPEAT = 0.7
 
 
-def _signal_key(asset: str, timeframe: str, entry_price: float) -> str:
-    raw = f"{asset}:{timeframe}:{entry_price:.6f}"
-    return hashlib.md5(raw.encode()).hexdigest()
+def daily_quota_key(asset: str, timeframe: str, signal_type: str, day_iso: str) -> str:
+    return f"{asset}|{timeframe}|{signal_type}|{day_iso}"
 
 
-def load_sent_keys(path: Path) -> Set[str]:
+def load_daily_sends(path: Path) -> Dict[str, int]:
+    today = date.today().isoformat()
     if not path.exists():
-        return set()
+        return {}
     with path.open("r", encoding="utf-8") as f:
         try:
-            data = json.load(f)
+            raw = json.load(f)
         except json.JSONDecodeError:
-            return set()
-    return set(data) if isinstance(data, list) else set()
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, int):
+            continue
+        parts = k.split("|")
+        if len(parts) >= 4 and parts[-1] == today:
+            out[k] = v
+    return out
 
 
-def save_sent_keys(path: Path, keys: Set[str]) -> None:
+def save_daily_sends(path: Path, data: Dict[str, int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        json.dump(sorted(keys), f, ensure_ascii=False)
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def load_signals(path: Path) -> Dict[str, Any]:
@@ -61,6 +74,8 @@ def collect_buy_signals(
     results: List[Dict[str, Any]] = []
 
     for asset, tf_map in data.items():
+        if str(asset).startswith("_"):
+            continue
         if asset_filter and asset not in asset_filter:
             continue
 
@@ -178,10 +193,35 @@ def collect_buy_signals(
                     "rsi_zone": indicators.get("rsi_zone"),
                     "ema_trend": indicators.get("ema_trend"),
                     "macd_signal": indicators.get("macd_signal"),
+                    "support_level": indicators.get("support_level"),
+                    "resistance_level": indicators.get("resistance_level"),
+                    "volume_confirmation": indicators.get("volume_confirmation"),
                 }
             )
 
     return results
+
+
+def _fmt_price(x: Any) -> str:
+    """Цены для USDT и для малых кросс-пар (например XLM/BTC — не обрезать до 0.0000)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    av = abs(v)
+    if av == 0:
+        return "0"
+    if av >= 100:
+        return f"{v:.2f}"
+    if av >= 1:
+        s = f"{v:.4f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+    if av >= 0.01:
+        s = f"{v:.6f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+    nd = min(12, max(6, int(math.ceil(-math.log10(av))) + 3))
+    s = f"{v:.{nd}f}".rstrip("0").rstrip(".")
+    return s if s else "0"
 
 
 def build_message(signals: List[Dict[str, Any]]) -> str:
@@ -191,15 +231,11 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
 
     for s in signals:
         signal_type = str(s.get("signal_type") or "").upper()
-        timeframe = str(s.get("timeframe") or "")
 
         if signal_type == "BUY":
-            if timeframe in ("1h", "4h", "1d"):
-                mode_prefix = "[СПОТ/ЛОНГ]"
-            else:
-                mode_prefix = "[ЛОНГ]"
+            mode_prefix = "[СПОТ / ПОКУПКА]"
         else:
-            mode_prefix = "[ШОРТ]"
+            mode_prefix = "[СПОТ / ПРОДАЖА]"
 
         strength = str(s.get("strength") or "").upper()
         if strength == "STRONG":
@@ -238,7 +274,7 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
         if primary_rr is not None:
             rr_text = f"R/R (к TP1): {primary_rr:.2f}"
         tp_levels = ", ".join(
-            f"{tp.get('level'):.4f} (p={tp.get('probability', 0):.2f})"
+            f"{_fmt_price(tp.get('level'))} (p={tp.get('probability', 0):.2f})"
             for tp in s.get("take_profit", [])
             if isinstance(tp, dict) and "level" in tp
         )
@@ -249,35 +285,41 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
             f"(conf={s['confidence']:.2f})"
         )
 
-        if signal_type == "BUY" and timeframe in ("1h", "4h", "1d"):
-            if primary_tp_level is not None:
-                lines.append(
-                    f"СПОТ: цена входа {entry:.4f}, план закрытия {primary_tp_level:.4f}"
-                )
-            else:
-                lines.append(f"СПОТ: цена входа {entry:.4f}")
-        elif signal_type == "BUY":
-            if primary_tp_level is not None:
-                lines.append(
-                    f"ФЬЮЧЕРС ЛОНГ: цена входа {entry:.4f}, цена выхода {primary_tp_level:.4f}"
-                )
-            else:
-                lines.append(f"ФЬЮЧЕРС ЛОНГ: цена входа {entry:.4f}")
+        if primary_tp_level is not None:
+            lines.append(
+                f"СПОТ: цена входа {_fmt_price(entry)}, план закрытия {_fmt_price(primary_tp_level)}"
+            )
         else:
-            if primary_tp_level is not None:
-                lines.append(
-                    f"ФЬЮЧЕРС ШОРТ: цена входа {entry:.4f}, цена выхода {primary_tp_level:.4f}"
-                )
-            else:
-                lines.append(f"ФЬЮЧЕРС ШОРТ: цена входа {entry:.4f}")
+            lines.append(f"СПОТ: цена входа {_fmt_price(entry)}")
 
         lines.append(
-            f"Вход: {s['entry_price']:.4f}, SL: {s['stop_loss']:.4f}"
+            f"Вход: {_fmt_price(s['entry_price'])}, SL: {_fmt_price(s['stop_loss'])}"
         )
         if rr_text:
             lines.append(rr_text)
         if tp_levels:
             lines.append(f"TP: {tp_levels}")
+
+        sr_bits: List[str] = []
+        sup = s.get("support_level")
+        res = s.get("resistance_level")
+        if sup is not None:
+            try:
+                sr_bits.append(f"поддержка {_fmt_price(float(sup))}")
+            except (TypeError, ValueError):
+                sr_bits.append(f"поддержка {sup}")
+        if res is not None:
+            try:
+                sr_bits.append(f"сопротивление {_fmt_price(float(res))}")
+            except (TypeError, ValueError):
+                sr_bits.append(f"сопротивление {res}")
+        vc = s.get("volume_confirmation")
+        if vc is True:
+            sr_bits.append("объём выше среднего (подтверждение)")
+        elif vc is False:
+            sr_bits.append("объём без всплеска")
+        if sr_bits:
+            lines.append("📍 " + " | ".join(sr_bits))
 
         # контекст: RSI, EMA тренд, MACD
         ctx_parts = []
@@ -448,14 +490,25 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
         print("Нет сигналов, удовлетворяющих фильтрам.")
         return
 
-    sent_keys = load_sent_keys(SENT_SIGNALS_PATH)
-    new_signals = [
-        s for s in filtered_signals
-        if _signal_key(s["asset"], s["timeframe"], s["entry_price"]) not in sent_keys
-    ]
+    today = date.today().isoformat()
+    daily_sends = load_daily_sends(TELEGRAM_DAILY_SENDS_PATH)
+    floor = max(float(args.min_confidence), MIN_SIGNAL_CONFIDENCE_REPEAT)
+    new_signals: List[Dict[str, Any]] = []
+    for s in filtered_signals:
+        if float(s.get("confidence") or 0.0) < floor:
+            continue
+        k = daily_quota_key(
+            str(s["asset"]), str(s["timeframe"]), str(s.get("signal_type") or ""), today
+        )
+        if daily_sends.get(k, 0) >= MAX_SIGNAL_SENDS_PER_DAY:
+            continue
+        new_signals.append(s)
 
     if not new_signals:
-        print("Все сигналы уже были отправлены ранее.")
+        print(
+            "Нет сигналов для рассылки: дневной лимит "
+            f"{MAX_SIGNAL_SENDS_PER_DAY} на актив/ТФ/тип или порог уверенности < {floor:.0%}."
+        )
         return
 
     # сохраняем активные сигналы для последующего трекинга TP/SL
@@ -474,8 +527,14 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
 
     if sent > 0:
         for s in new_signals:
-            sent_keys.add(_signal_key(s["asset"], s["timeframe"], s["entry_price"]))
-        save_sent_keys(SENT_SIGNALS_PATH, sent_keys)
+            k = daily_quota_key(
+                str(s["asset"]),
+                str(s["timeframe"]),
+                str(s.get("signal_type") or ""),
+                today,
+            )
+            daily_sends[k] = daily_sends.get(k, 0) + 1
+        save_daily_sends(TELEGRAM_DAILY_SENDS_PATH, daily_sends)
 
     print(f"Отправлено {len(new_signals)} сигналов {sent} подписчикам.")
 
@@ -488,7 +547,7 @@ def parse_args() -> argparse.Namespace:
         "--signals-file",
         type=str,
         default="signals.json",
-        help="Путь к JSON файлу(ам) с сигналами, через запятую (например: signals_binance.json,signals_stocks.json)",
+        help="Путь к JSON файлу(ам) с сигналами, через запятую",
     )
     parser.add_argument(
         "--min-confidence",

@@ -5,54 +5,18 @@ import json
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from src.utils.config import load_config
+from src.utils.config import load_config, get_assets, get_timeframes
 
 
-CRYPTO_ASSETS: List[str] = ["ETH", "SOL", "BTC"]
-STOCK_ASSETS: List[str] = [
-    "MU",
-    "SNDK",
-    "LITE",
-    "TSM",
-    "GOOGL",
-    "GOOG",
-    "ASML",
-    "AMD",
-    "AMZN",
-    "PLTR",
-    "MRVL",
-    "AVGO",
-    "FXI",
-    "NFLX",
-    "META",
-    "NVDA",
-    "MSFT",
-    "IWM",
-    "QQQ",
-    "SPY",
-    "XLF",
-    "AAPL",
-    "DIA",
-    "XLP",
-    "GLD",
-    "XOP",
-    "SLV",
-    "USO",
-    "TSLA",
-]
-TIMEFRAMES_CRYPTO: List[str] = ["5m", "15m", "1h", "4h", "1d"]
-TIMEFRAMES_STOCKS: List[str] = ["5m", "15m", "1h", "1d"]
-OUTPUT_FILE = "signals_eth_futures.json"
+OUTPUT_FILE = "signals_spot.json"
 INCLUDE_SELL = True
 
 
 def run_analysis() -> Optional[str]:
-    jobs = [
-        (CRYPTO_ASSETS, TIMEFRAMES_CRYPTO, "signals_crypto_tmp.json"),
-        (STOCK_ASSETS, TIMEFRAMES_STOCKS, "signals_stocks_tmp.json"),
-    ]
+    cfg = load_config("config/config.yaml")
+    jobs = [(get_assets(cfg), get_timeframes(cfg), "signals_crypto_tmp.json")]
 
     combined: Dict[str, Any] = {}
     have_data = False

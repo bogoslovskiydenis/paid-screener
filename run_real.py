@@ -40,6 +40,8 @@ try:
     from src.analytics.patterns.head_shoulders import HeadShouldersPattern
     from src.analytics.patterns.chart_patterns import ChartPatternDetector
     from src.analytics.indicators.rsi import RSICalculator
+    from src.analytics.rotation_filters import compute_rotation_bundle, format_rotation_console
+    from src.analytics.entry_spot_filters import compute_spot_long_bundle, format_spot_long_console
     print("✓ Модули проекта загружены")
 except ImportError as e:
     print(f"✗ Ошибка импорта модулей: {e}")
@@ -50,13 +52,8 @@ except ImportError as e:
 logger = setup_logger(__name__)
 
 
-CRYPTO_ASSETS = {"ETH", "SOL", "BTC"}
-FUNDING_RATE_THRESHOLD = 0.0005  # 0.05% — граница перегрева
-
-# Таймфреймы по бирже
-BINANCE_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
-INVESTING_TIMEFRAMES = ["5m", "1d"]
-
+FUNDING_USDT_ASSETS = frozenset({"ETH", "SOL", "BTC"})
+FUNDING_RATE_THRESHOLD = 0.0005  # перпы (сырой funding для фильтра лонгов/шортов на USDT-парах)
 
 def _btc_allows_buy(df: "pd.DataFrame", levels_analyzer: SupportResistanceAnalyzer) -> bool:
     """Фильтр: разрешать ли покупки по альтам исходя из BTC."""
@@ -92,7 +89,7 @@ def main():
         help="Актив или несколько активов через запятую (например: ETH,XRP)",
     )
     parser.add_argument("--timeframes", type=str, default="", help="Переопределить таймфреймы для всех бирж (необязательно)")
-    parser.add_argument("--min-confidence", type=float, default=0.6, help="Минимальная уверенность сигнала")
+    parser.add_argument("--min-confidence", type=float, default=0.7, help="Минимальная уверенность сигнала и переливов")
     parser.add_argument("--export-json", action="store_true", help="Экспорт в JSON")
     parser.add_argument("--output", type=str, default="signals.json", help="Файл вывода")
     parser.add_argument("--limit", type=int, default=500, help="Количество свечей для загрузки")
@@ -120,8 +117,8 @@ def main():
         )
 
         print(f"Активы: {', '.join(assets)}")
-        print(f"Binance таймфреймы: {', '.join(override_timeframes or BINANCE_TIMEFRAMES)}")
-        print(f"Investing таймфреймы: {', '.join(override_timeframes or INVESTING_TIMEFRAMES)}")
+        cfg_tfs = get_timeframes(config)
+        print(f"Таймфреймы: {', '.join(override_timeframes or cfg_tfs)}")
         print(f"Количество свечей: {args.limit}")
         print("=" * 70)
         print()
@@ -149,8 +146,6 @@ def main():
             price_tolerance=config.get("analysis", {}).get("support_resistance", {}).get("price_tolerance", 0.005)
         )
         
-        from src.parsers.exchange_manager import BINANCE_SYMBOLS
-
         results = {}
         btc_buy_allowed_cache = {}
         funding_rate_cache = {}
@@ -158,16 +153,14 @@ def main():
         # Обработка каждого актива и таймфрейма
         for asset in assets:
             results[asset] = {}
-            is_binance = asset.upper() in BINANCE_SYMBOLS
-            timeframes = override_timeframes or (BINANCE_TIMEFRAMES if is_binance else INVESTING_TIMEFRAMES)
+            timeframes = override_timeframes or get_timeframes(config)
 
             for timeframe in timeframes:
                 print(f"Обработка {asset}/{timeframe}...")
                 print("-" * 70)
                 
                 try:
-                    source = "Binance" if is_binance else "Investing.com"
-                    print(f"Загрузка данных с {source}...")
+                    print("Загрузка данных с Binance...")
                     df = exchange_manager.get_ohlcv(asset, timeframe, limit=args.limit)
                     
                     if df.empty:
@@ -271,7 +264,7 @@ def main():
                             database.save_pattern(pattern_data)
                     
                     btc_buy_allowed = True
-                    if asset in ("ETH", "SOL"):
+                    if "/" not in asset and asset in ("ETH", "SOL"):
                         if timeframe in btc_buy_allowed_cache:
                             btc_buy_allowed = btc_buy_allowed_cache[timeframe]
                         else:
@@ -285,7 +278,7 @@ def main():
 
                     # Funding rate фильтр (только для крипто, только 1 раз на таймфрейм)
                     funding_rate = None
-                    if asset in CRYPTO_ASSETS:
+                    if "/" not in asset and asset in FUNDING_USDT_ASSETS:
                         fr_cache_key = asset
                         if fr_cache_key not in funding_rate_cache:
                             funding_rate_cache[fr_cache_key] = exchange_manager.get_funding_rate(asset)
@@ -361,6 +354,21 @@ def main():
                     results[asset][timeframe] = {"error": str(e)}
                 
                 print()
+
+        rotation_bundle = compute_rotation_bundle(
+            results, anchor_tf="1d", min_confidence=args.min_confidence
+        )
+        results["_rotation"] = rotation_bundle
+        print(format_rotation_console(rotation_bundle))
+
+        spot_bundle = compute_spot_long_bundle(
+            results,
+            anchor_tf="1d",
+            timing_tf="4h",
+            min_confidence=args.min_confidence,
+        )
+        results["_spot_long_entry"] = spot_bundle
+        print(format_spot_long_console(spot_bundle))
         
         # Экспорт результатов
         if args.export_json:

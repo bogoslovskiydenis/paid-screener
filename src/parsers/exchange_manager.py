@@ -1,23 +1,20 @@
 """Менеджер для работы с несколькими биржами."""
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 
 from .base import BaseParser
 from .binance_parser import BinanceParser
-from .investing_parser import InvestingParser
 from ..utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-
-# Только эти активы идут на Binance; всё остальное — на Investing
-BINANCE_SYMBOLS: Set[str] = {"ETH", "SOL", "BTC"}
+BINANCE_USDT_BASES: Set[str] = {"ETH", "SOL", "BTC", "BNB", "XLM"}
 
 
 class ExchangeManager:
     """Управляет несколькими парсерами бирж."""
-    
+
     def __init__(self, enabled_exchanges: Optional[List[str]] = None):
         self.parsers: Dict[str, BaseParser] = {}
         self.enabled_exchanges = enabled_exchanges or ["binance"]
@@ -32,28 +29,20 @@ class ExchangeManager:
             except Exception as exc:
                 logger.warning(f"Failed to initialize Binance parser: {exc}")
 
-        if "investing" in self.enabled_exchanges:
-            try:
-                self.parsers["investing"] = InvestingParser()
-                logger.info("Investing parser initialized")
-            except Exception as exc:
-                logger.warning(f"Failed to initialize Investing parser: {exc}")
-
     def _select_parser(self, asset: str, exchange: Optional[str]) -> BaseParser:
         if exchange and exchange in self.parsers:
             return self.parsers[exchange]
 
-        asset_upper = (asset or "").upper()
-        if asset_upper in BINANCE_SYMBOLS and "binance" in self.parsers:
+        asset_upper = (asset or "").strip().upper().replace(" ", "")
+        if "/" in asset_upper and "binance" in self.parsers:
+            return self.parsers["binance"]
+        if asset_upper in BINANCE_USDT_BASES and "binance" in self.parsers:
             return self.parsers["binance"]
 
-        if "investing" in self.parsers:
-            return self.parsers["investing"]
-
-        if self.parsers:
-            return list(self.parsers.values())[0]
-
-        raise ValueError("No available exchanges")
+        raise ValueError(
+            f"Нет источника данных для актива {asset!r} "
+            f"(спот: {sorted(BINANCE_USDT_BASES)} или кросс-пара вида ETH/BTC)"
+        )
 
     def get_ohlcv(
         self,
@@ -83,4 +72,3 @@ class ExchangeManager:
             return None
         fetch = getattr(parser, "fetch_funding_rate", None)
         return fetch(asset) if callable(fetch) else None
-

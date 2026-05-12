@@ -29,8 +29,11 @@ class BaseParser(ABC):
         pass
     
     def normalize_symbol(self, asset: str) -> str:
-        """Нормализует символ для биржи."""
-        return f"{asset}/USDT"
+        """Нормализует символ для биржи (спот USDT или кросс, например ETH/BTC)."""
+        s = (asset or "").strip().upper().replace(" ", "")
+        if "/" in s:
+            return s
+        return f"{s}/USDT"
     
     def validate_ohlcv(self, df: pd.DataFrame) -> pd.DataFrame:
         """Валидирует OHLCV данные."""

@@ -58,8 +58,7 @@ dependencies = [
     "scipy",
     "sqlalchemy",
     "ccxt",
-    "pydantic",
-    "pydantic_settings"
+    "dotenv",
 ]
 
 missing = []

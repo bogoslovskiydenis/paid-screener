@@ -5,9 +5,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from datetime import datetime
+
 import pandas as pd
 
 from src.parsers.exchange_manager import ExchangeManager
+from src.storage.database import Database
+from src.utils.config import Settings
 from telegram_bot import (
     TELEGRAM_BOT_TOKEN,
     load_subscribers,
@@ -19,8 +23,7 @@ ACTIVE_SIGNALS_PATH = Path("data/active_signals.json")
 SUBSCRIBERS_PATH = Path("data/telegram_subscribers.json")
 STATS_PATH = Path("data/trade_stats.json")
 
-# Только эти активы отслеживаем — остальные (акции) пропускаем
-BINANCE_ASSETS = {"ETH", "SOL", "BTC"}
+BINANCE_ASSETS = {"ETH", "SOL", "BTC", "BNB", "XLM", "ETH/BTC", "SOL/ETH", "SOL/BTC", "XLM/BTC"}
 
 
 def load_active_signals(path: Path) -> List[Dict[str, Any]]:
@@ -181,7 +184,8 @@ def build_result_message(
 
 
 def track_signals(interval_seconds: int = 60) -> None:
-    exchange_manager = ExchangeManager(["binance", "investing"])
+    exchange_manager = ExchangeManager(["binance"])
+    db = Database(Settings().database_url)
     subscribers = load_subscribers(SUBSCRIBERS_PATH)
     if not subscribers:
         print("Подписчиков нет, отслеживать некому.")
@@ -212,7 +216,6 @@ def track_signals(interval_seconds: int = 60) -> None:
                 updated_signals.append(signal)
                 continue
 
-            # Акции не отслеживаем — только Binance крипто
             if asset.upper() not in BINANCE_ASSETS:
                 updated_signals.append(signal)
                 continue
@@ -322,6 +325,32 @@ def track_signals(interval_seconds: int = 60) -> None:
                     "win_rate": win_rate,
                 }
             )
+            save_stats(STATS_PATH, stats)
+
+            try:
+                snap = {k: v for k, v in signal.items()}
+                db.save_trade(
+                    {
+                        "asset": asset,
+                        "timeframe": timeframe,
+                        "signal_type": signal_type,
+                        "strength": str(signal.get("strength") or ""),
+                        "entry_price": float(signal.get("entry_price")),
+                        "exit_price": float(price),
+                        "result": result,
+                        "confidence": float(signal.get("confidence") or 0.0),
+                        "risk_usd": risk_usd if risk_usd > 0 else None,
+                        "qty": qty if qty > 0 else None,
+                        "pnl_usd": test_pnl_usd,
+                        "pnl_rr": test_pnl_rr,
+                        "opened_at": None,
+                        "closed_at": datetime.utcnow(),
+                        "source": "tracker",
+                        "signal_snapshot": snap,
+                    }
+                )
+            except Exception as exc:
+                print(f"Журнал сделок: ошибка записи в БД: {exc}")
 
             text = build_result_message(
                 asset=asset,
@@ -353,7 +382,6 @@ def track_signals(interval_seconds: int = 60) -> None:
         # оставляем только незакрытые сигналы
         open_signals = [s for s in updated_signals if s.get("status") not in {"TP", "SL", "TSL"}]
         save_active_signals(ACTIVE_SIGNALS_PATH, open_signals)
-        save_stats(STATS_PATH, stats)
         time.sleep(interval_seconds)
 
 
