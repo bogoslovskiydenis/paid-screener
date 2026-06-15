@@ -215,7 +215,9 @@ class Database:
                     signal_data_copy[key] = float(value) if isinstance(value, np.floating) else int(value)
                 elif isinstance(value, (bool, np.bool_)):
                     signal_data_copy[key] = bool(value)
-            
+
+            _SIGNAL_COLUMNS = {c.name for c in Signal.__table__.columns}
+            signal_data_copy = {k: v for k, v in signal_data_copy.items() if k in _SIGNAL_COLUMNS}
             signal = Signal(**signal_data_copy)
             session.add(signal)
             session.commit()
@@ -335,6 +337,66 @@ class Database:
             session.rollback()
             logger.error(f"Error saving trade: {e}")
             raise
+        finally:
+            session.close()
+
+    def get_trade_analytics(self) -> Dict[str, Any]:
+        """Агрегированная аналитика по закрытым сделкам из таблицы trades."""
+        session = self.get_session()
+        try:
+            trades = session.query(Trade).all()
+            if not trades:
+                return {"total": 0}
+
+            total = len(trades)
+            wins = sum(1 for t in trades if t.result in ("TP", "TSL"))
+            losses = sum(1 for t in trades if t.result == "SL")
+            win_rate = wins / total * 100 if total else 0.0
+
+            pnl_values = [t.pnl_usd for t in trades if t.pnl_usd is not None]
+            rr_values = [t.pnl_rr for t in trades if t.pnl_rr is not None]
+
+            def _group_stats(key_fn) -> Dict[str, Any]:
+                groups: Dict[str, list] = {}
+                for t in trades:
+                    k = key_fn(t)
+                    groups.setdefault(k, []).append(t)
+                out = {}
+                for k, ts in sorted(groups.items()):
+                    w = sum(1 for t in ts if t.result in ("TP", "TSL"))
+                    out[k] = {
+                        "total": len(ts),
+                        "wins": w,
+                        "losses": len(ts) - w,
+                        "win_rate": round(w / len(ts) * 100, 1),
+                        "pnl_usd": round(sum(t.pnl_usd for t in ts if t.pnl_usd), 2),
+                    }
+                return out
+
+            def _conf_bucket(t: Trade) -> str:
+                c = t.confidence or 0
+                if c >= 0.85:
+                    return "0.85+"
+                if c >= 0.80:
+                    return "0.80-0.85"
+                if c >= 0.75:
+                    return "0.75-0.80"
+                return "<0.75"
+
+            return {
+                "total": total,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round(win_rate, 1),
+                "total_pnl_usd": round(sum(pnl_values), 2) if pnl_values else None,
+                "avg_rr_on_wins": round(
+                    sum(r for r in rr_values if r and r > 0) / max(1, sum(1 for r in rr_values if r and r > 0)), 2
+                ) if rr_values else None,
+                "by_asset": _group_stats(lambda t: t.asset),
+                "by_timeframe": _group_stats(lambda t: t.timeframe),
+                "by_strength": _group_stats(lambda t: t.strength or "?"),
+                "by_confidence": _group_stats(_conf_bucket),
+            }
         finally:
             session.close()
 

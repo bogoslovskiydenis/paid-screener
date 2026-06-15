@@ -4,6 +4,7 @@ assets:
   - BTC      # BTC/USDT спот
   - BNB      # BNB/USDT спот — высокая ликвидность, бета к бирже
   - XLM      # XLM/USDT спот
+  - SUI      # SUI/USDT спот
   - "ETH/BTC"
   - "SOL/ETH"
   - "SOL/BTC"
@@ -45,4 +46,29 @@ analysis:
 
 updates:
   interval_seconds: 60
+
+accumulation_scan:
+  enabled: false              # включается через --pump-scan флаг
+  timeframe: 1d               # дневной таймфрейм — накопление видно здесь
+  top_n: 50                   # больше монет чем pump scan — накопление редкое
+  limit: 100                  # 100 дневных свечей = ~3 месяца
+  min_volume_usd: 5000000
+  min_market_cap_usd: 50000000
+  sideways_period: 20         # сколько свечей смотреть для боковика
+  sideways_threshold: 0.18    # монета в боковике ±18% за 20 дней
+  rsi_min: 25.0               # RSI ниже = паника, не накопление
+  rsi_max: 62.0               # RSI выше = уже не накопление, уже рост
+  min_score: 0.55
+
+pump_scan:
+  enabled: false            # true — включить в каждой итерации; или запускать через --pump-scan
+  timeframe: 1h             # таймфрейм для pump-анализа (1h — быстрее ловит движение)
+  top_n: 30                 # сколько топ-альтов сканировать
+  limit: 120                # кол-во свечей (120h = 5 дней)
+  min_volume_usd: 5000000   # минимальный суточный объём (фильтр ликвидности), $5M
+  min_market_cap_usd: 50000000  # минимальная рыночная капитализация, $50M (данные CoinGecko)
+  volume_multiplier: 2.0    # объём прорыва >= N×avg(20)
+  rsi_min: 35.0             # hard-фильтр снизу (ниже = нисходящий тренд)
+  rsi_max: 72.0             # hard-фильтр сверху (выше = уже поздно)
+  squeeze_lookback: 30      # сколько свечей смотреть для BB squeeze
 

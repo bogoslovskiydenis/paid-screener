@@ -1,9 +1,12 @@
 """Парсер для Binance."""
 import pandas as pd
 import time
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, List
 from .base import BaseParser
 from ..utils.retry import retry_with_backoff
+from ..utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class BinanceParser(BaseParser):
@@ -73,5 +76,72 @@ class BinanceParser(BaseParser):
             rate = data.get("fundingRate")
             return float(rate) if rate is not None else None
         except Exception:
+            return None
+
+    def fetch_long_short_ratio(self, asset: str) -> Optional[float]:
+        """
+        Возвращает долю лонг-аккаунтов (0–1) из Global L/S Account Ratio Binance.
+        Например, 0.65 = 65% аккаунтов держат лонг.
+        Требует Binance FAPI; возвращает None при любой ошибке.
+        """
+        try:
+            method = getattr(self.exchange, "fapiPublicGetGlobalLongShortAccountRatio", None)
+            if not callable(method):
+                return None
+            data = method({"symbol": f"{asset}USDT", "period": "1h", "limit": 1})
+            if data and isinstance(data, list) and len(data) > 0:
+                long_account = data[-1].get("longAccount")
+                if long_account is not None:
+                    return float(long_account)
+            return None
+        except Exception:
+            return None
+
+    def fetch_open_interest(self, asset: str) -> Optional[float]:
+        """
+        Возвращает текущий Open Interest (в контрактах) для perpetual фьючерса.
+        Используется для отслеживания динамики между итерациями.
+        """
+        try:
+            method = getattr(self.exchange, "fapiPublicGetOpenInterest", None)
+            if not callable(method):
+                return None
+            data = method({"symbol": f"{asset}USDT"})
+            oi = data.get("openInterest")
+            return float(oi) if oi is not None else None
+        except Exception:
+            return None
+
+    def fetch_top_usdt_pairs(
+        self,
+        top_n: int = 50,
+        min_volume_usd: float = 20_000_000,
+    ) -> List[str]:
+        """Возвращает базовые тикеры топ-N USDT-пар по 24ч объёму с Binance."""
+        try:
+            tickers = self.exchange.fetch_tickers()
+            pairs: List[tuple] = []
+            for symbol, ticker in tickers.items():
+                if not symbol.endswith("/USDT"):
+                    continue
+                quote_vol = ticker.get("quoteVolume") or 0.0
+                if float(quote_vol) < min_volume_usd:
+                    continue
+                base = symbol.split("/")[0]
+                pairs.append((base, float(quote_vol)))
+            pairs.sort(key=lambda x: x[1], reverse=True)
+            return [base for base, _ in pairs[:top_n]]
+        except Exception as exc:
+            logger.warning("Не удалось загрузить топ USDT-пары: %s", exc)
+            return []
+
+    def fetch_order_book(self, asset: str, limit: int = 100) -> Optional[Dict[str, Any]]:
+        """Возвращает стакан заявок: {bids: [[price, qty], ...], asks: [...]}."""
+        try:
+            symbol = f"{asset}/USDT" if "/" not in asset else asset
+            ob = self.exchange.fetch_order_book(symbol, limit=limit)
+            return {"bids": ob.get("bids", []), "asks": ob.get("asks", [])}
+        except Exception as exc:
+            logger.warning("Не удалось загрузить стакан %s: %s", asset, exc)
             return None
 

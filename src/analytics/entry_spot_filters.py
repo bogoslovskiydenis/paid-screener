@@ -5,23 +5,27 @@ from typing import Any, Dict, List, Optional
 
 DEFAULT_ANCHOR_TF = "1d"
 DEFAULT_TIMING_TF = "4h"
-SPOT_USDT_ASSETS = ("ETH", "SOL", "BTC", "BNB", "XLM")
+SPOT_USDT_ASSETS = ("ETH", "SOL", "BTC", "BNB", "XLM", "SUI")
 
 METRICS_RU = """
-Метрики для более аккуратного входа в лонг (спот), без новых API:
+Метрики для входа в лонг (спот):
 
-Старший ТФ (по умолчанию 1d):
+Старший ТФ (1d):
   • EMA: бычий тренд или бычий кросс EMA9/EMA21.
-  • RSI пары <72 и не «жарко» (≥70).
+  • RSI <70.
 
-Младший ТФ (по умолчанию 4h):
-  • RSI не в перекупе на этом ТФ, rsi < 68.
-  • MACD сигнал не SELL.
-  • Ближайшая поддержка снизу не дальше 2% от цены (если уровни есть).
+Младший ТФ (4h):
+  • RSI не в перекупе, rsi < 68.
+  • MACD не SELL.
+  • Структура рынка не BEARISH (≥80%).
 
-Если есть BUY от генератора — дополнительно проверка confidence ≥ порога.
+MTF Confluence:
+  • Направление не BEARISH или score ≥ 40%.
 
-«ДА» = все обязательные условия для актива выполнены.
+Рыночный контекст:
+  • Fear & Greed > 20 (не Extreme Fear) — иначе требуется BUY сигнал.
+
+BUY сигнал генератора — обязателен для финального «ДА».
 """
 
 
@@ -80,6 +84,36 @@ def _nearest_support_dist_pct(levels: Any, price: float) -> Optional[float]:
     return (price - sup) / price * 100.0
 
 
+def _confluence(results: Dict[str, Any], asset: str) -> Optional[Dict[str, Any]]:
+    a = results.get(asset)
+    if not isinstance(a, dict):
+        return None
+    c = a.get("_confluence")
+    return c if isinstance(c, dict) else None
+
+
+def _fear_greed(results: Dict[str, Any]) -> Optional[int]:
+    ctx = results.get("_market_context")
+    if not isinstance(ctx, dict):
+        return None
+    fg = ctx.get("fear_greed")
+    if not isinstance(fg, dict):
+        return None
+    v = fg.get("value")
+    return int(v) if isinstance(v, (int, float)) else None
+
+
+def _market_structure_bearish_pct(block: Dict[str, Any]) -> Optional[float]:
+    ms = block.get("market_structure")
+    if not isinstance(ms, dict):
+        return None
+    struct = str(ms.get("structure") or "")
+    strength = ms.get("trend_strength")
+    if struct == "BEARISH" and isinstance(strength, (int, float)):
+        return float(strength)
+    return 0.0
+
+
 def _score_asset_long(
     results: Dict[str, Any],
     asset: str,
@@ -106,6 +140,7 @@ def _score_asset_long(
             "checks": checks,
         }
 
+    # 1. EMA на старшем ТФ
     ema_a = _ema(ab)
     trend = str(ema_a.get("trend") or "")
     cross = str(ema_a.get("ema_cross") or "")
@@ -118,9 +153,9 @@ def _score_asset_long(
         }
     )
 
+    # 2. RSI на старшем ТФ
     rsi_a = _rsi(ab)
-    hot_a = rsi_a is not None and rsi_a >= 70.0
-    rsi_a_ok = rsi_a is None or (rsi_a < 72.0 and not hot_a)
+    rsi_a_ok = rsi_a is None or rsi_a < 70.0
     checks.append(
         {
             "name": f"{anchor_tf} RSI",
@@ -129,6 +164,7 @@ def _score_asset_long(
         }
     )
 
+    # 3. RSI на младшем ТФ
     zone_t = _rsi_zone(tb)
     rsi_t = _rsi(tb)
     timing_rsi_ok = zone_t.upper() != "OVERBOUGHT" and (rsi_t is None or rsi_t < 68.0)
@@ -140,6 +176,7 @@ def _score_asset_long(
         }
     )
 
+    # 4. MACD на младшем ТФ
     mac_t = _macd_sig(tb)
     mac_ok = mac_t != "SELL"
     checks.append(
@@ -150,24 +187,54 @@ def _score_asset_long(
         }
     )
 
-    cp = float(tb.get("current_price") or 0)
-    levels = tb.get("levels")
-    dist = _nearest_support_dist_pct(levels, cp) if cp else None
-    near_support = dist is not None and dist <= 2.0
+    # 5. Структура рынка на 4h — не должна быть глубоко медвежьей
+    bear_pct = _market_structure_bearish_pct(tb)
+    struct_ok = bear_pct is None or bear_pct < 0.80
+    struct_detail = f"BEARISH {bear_pct:.0%}" if bear_pct and bear_pct > 0 else "OK"
     checks.append(
         {
-            "name": "близость к поддержке (≤2%)",
-            "ok": True if dist is None else near_support,
-            "detail": f"dist%={dist:.3f}" if dist is not None else "уровней нет",
+            "name": f"{timing_tf} структура (не BEAR ≥80%)",
+            "ok": struct_ok,
+            "detail": struct_detail,
         }
     )
 
-    structural = anchor_trend_ok and rsi_a_ok and timing_rsi_ok and mac_ok
+    # 6. MTF Confluence — направление не должно быть BEARISH
+    conf_data = _confluence(results, asset)
+    if conf_data:
+        conf_dir = str(conf_data.get("direction") or "")
+        conf_score = float(conf_data.get("score") or 0)
+        mtf_ok = conf_dir != "BEARISH" or conf_score >= 0.40
+        checks.append(
+            {
+                "name": "MTF Confluence (не BEARISH)",
+                "ok": mtf_ok,
+                "detail": f"{conf_dir} ({conf_score:.0%})",
+            }
+        )
+    else:
+        mtf_ok = True
 
+    # 7. Fear & Greed — в Extreme Fear нужен BUY сигнал
+    fg = _fear_greed(results)
+    fg_ok = fg is None or fg > 20
+    checks.append(
+        {
+            "name": "Fear&Greed > 20 (не паника)",
+            "ok": fg_ok,
+            "detail": f"F&G={fg}" if fg is not None else "N/A",
+        }
+    )
+
+    structural = (
+        anchor_trend_ok and rsi_a_ok and timing_rsi_ok
+        and mac_ok and struct_ok and mtf_ok
+    )
+
+    # 8. BUY сигнал генератора — ОБЯЗАТЕЛЕН
     sig = tb.get("signal") if isinstance(tb.get("signal"), dict) else None
     sig_buy = sig and str(sig.get("signal_type") or "").upper() == "BUY"
     sig_conf = float(sig["confidence"]) if sig and sig.get("confidence") is not None else None
-    pre_frac = sum(1 for c in checks if c.get("ok")) / max(len(checks), 1)
 
     if sig_buy and sig_conf is not None:
         gate = sig_conf >= min_confidence
@@ -178,7 +245,8 @@ def _score_asset_long(
                 "detail": f"{sig_conf:.1%}",
             }
         )
-        active = structural and gate
+        active = structural and gate and fg_ok
+        pre_frac = sum(1 for c in checks if c.get("ok")) / max(len(checks), 1)
         conf_rep = sig_conf if active else min(sig_conf, pre_frac)
         return {
             "asset": asset,
@@ -192,14 +260,13 @@ def _score_asset_long(
         }
 
     checks.append({"name": "BUY сигнал генератора", "ok": False, "detail": "нет"})
-    inner = 1.0 if structural else pre_frac
-    active = structural and inner >= min_confidence
+    pre_frac = sum(1 for c in checks if c.get("ok")) / max(len(checks), 1)
     return {
         "asset": asset,
         "anchor_tf": anchor_tf,
         "timing_tf": timing_tf,
-        "active": active,
-        "confidence": round(inner, 4),
+        "active": False,
+        "confidence": round(pre_frac, 4),
         "signal_confidence": None,
         "structure_ok": structural,
         "checks": checks,

@@ -1,3 +1,6 @@
-"""Paid Screener — подмодули импортируйте явно (например `from src.main import main`)."""
+"""Paid Screener — подмодули импортируйте явно.
+
+Точка запуска: run_real.py (или run.py как алиас).
+"""
 
 __version__ = "1.0.0"

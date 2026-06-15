@@ -48,3 +48,7 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Runtime output (генерируется при запуске скринера)
+signals*.json
+test_real.json
+
