@@ -15,7 +15,7 @@ except ImportError:
 def _apply_dotenv() -> None:
     env_file = Path(".env")
     if env_file.exists():
-        load_dotenv(env_file, encoding="utf-8")
+        load_dotenv(env_file, encoding="utf-8", override=True)
 
 
 _apply_dotenv()
@@ -73,7 +73,7 @@ def get_assets(config: Dict[str, Any]) -> List[str]:
     """Возвращает список активов из конфигурации."""
     return config.get(
         "assets",
-        ["ETH", "SOL", "BTC", "BNB", "XLM", "ETH/BTC", "SOL/ETH", "SOL/BTC", "XLM/BTC"],
+        ["ETH", "SOL", "BTC", "BNB", "XLM", "XRP", "SUI", "LTC", "HBAR", "ADA", "LINK", "AVAX", "ETH/BTC", "SOL/ETH", "SOL/BTC", "XLM/BTC"],
     )
 
 

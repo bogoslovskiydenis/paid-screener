@@ -478,6 +478,51 @@ def load_subscribers(path: Path) -> Set[int]:
     return {int(x) for x in data}
 
 
+def broadcast_trade_executed(
+    token: str,
+    subscribers_path: Path,
+    trade: Dict[str, Any],
+) -> None:
+    """Отправляет уведомление об исполненном ордере (REAL или PAPER)."""
+    subscribers = load_subscribers(subscribers_path)
+    if not subscribers:
+        return
+
+    mode = trade.get("mode", "REAL")
+    symbol = trade.get("symbol", "?")
+    signal_type = trade.get("signal_type", "BUY")
+    entry = float(trade.get("entry_price") or 0)
+    sl = trade.get("stop_loss")
+    tp = trade.get("take_profit")
+    qty = trade.get("qty", "?")
+    tf = trade.get("timeframe", "?")
+
+    icon = "✅" if signal_type == "BUY" else "🔴"
+    mode_tag = "" if mode == "REAL" else " <i>[PAPER]</i>"
+
+    tp_pct = abs((float(tp) - entry) / entry * 100) if entry and tp else None
+
+    qty_str = f"{qty:.6f}".rstrip("0").rstrip(".") if isinstance(qty, float) else str(qty)
+    lines = [
+        f"{icon} <b>КУПЛЕНО{mode_tag}</b>",
+        f"<b>{symbol}</b> / {tf}",
+        f"Цена входа: <b>${fmt_price(entry)}</b>  ({qty_str} шт)",
+    ]
+    if tp:
+        lines.append(f"TP: ${fmt_price(float(tp))}  (+{tp_pct:.1f}%)")
+    if sl:
+        sl_pct = abs(entry - float(sl)) / entry * 100 if entry else 0
+        lines.append(f"Справочный SL: ${fmt_price(float(sl))}  (-{sl_pct:.1f}%)")
+    lines.append("Стоп-лосс <b>не выставлен</b> — держим до TP")
+
+    text = "\n".join(lines)
+    for chat_id in subscribers:
+        try:
+            send_telegram_message(token, chat_id, text)
+        except Exception:
+            pass
+
+
 def save_subscribers(path: Path, chat_ids: Set[int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -862,7 +907,7 @@ def build_spot_overview_message(results: Dict[str, Any]) -> Optional[str]:
 
     # Multi-TF Confluence
     confluence_data: List[Dict[str, Any]] = []
-    for asset_name in ("ETH", "SOL", "BTC", "BNB", "XLM"):
+    for asset_name in ("ETH", "SOL", "BTC", "BNB", "XLM", "XRP", "SUI", "LTC", "HBAR", "ADA", "LINK", "AVAX"):
         asset_data = results.get(asset_name)
         if isinstance(asset_data, dict):
             conf = asset_data.get("_confluence")
@@ -958,6 +1003,129 @@ def broadcast_spot_overview(
         daily_sends[quota_key] = daily_sends.get(quota_key, 0) + 1
         save_daily_sends(TELEGRAM_DAILY_SENDS_PATH, daily_sends)
         print(f"Отправлен обзор рынка {sent} подписчикам ({daily_sends[quota_key]}/{max_per_day} сегодня).")
+
+
+def build_liq_message(liq_result: Dict[str, Any]) -> Optional[str]:
+    """Форматирует ликвидационные уровни для Telegram (HTML)."""
+    import pandas as pd
+
+    sym   = liq_result.get("symbol", "?")
+    price = liq_result.get("current_price", 0.0)
+    hist  = liq_result.get("hist", pd.DataFrame())
+    pred  = liq_result.get("pred", pd.DataFrame())
+    overlap_set = set(liq_result.get("overlap", []))
+
+    base = sym.replace("USDT", "")
+
+    def _usd(v: float) -> str:
+        if v >= 1_000_000_000:
+            return f"${v/1_000_000_000:.1f}B"
+        if v >= 1_000_000:
+            return f"${v/1_000_000:.0f}M"
+        if v >= 1_000:
+            return f"${v/1_000:.0f}K"
+        return f"${v:.0f}"
+
+    lines = [
+        f"📊 <b>Уровни ликвидации {base}</b> | ${price:,.2f}",
+        "",
+    ]
+
+    # --- Зоны риска ниже цены ---
+    has_danger = False
+    if not hist.empty:
+        below = hist[hist["price"] < price].nlargest(6, "long_usd")
+        if not below.empty:
+            lines.append("⚠️ <b>Ликвидации лонгов (риск вниз):</b>")
+            for _, r in below.iterrows():
+                spark = "⚡" if r["price"] in overlap_set else ""
+                if r["long_usd"] >= 50_000_000:
+                    tag = "◄◄◄"
+                elif r["long_usd"] >= 10_000_000:
+                    tag = "◄◄"
+                elif r["long_usd"] >= 3_000_000:
+                    tag = "◄"
+                else:
+                    tag = ""
+                lines.append(
+                    f"  <code>${r['price']:,.0f}</code> ({r['dist_pct']:+.1f}%) "
+                    f"— {_usd(r['long_usd'])} {tag} {spark}"
+                )
+            has_danger = True
+
+    # --- Прогноз B (топ-4 ниже цены) ---
+    if not pred.empty:
+        below_pred = pred[pred["price"] < price].head(4)
+        if not below_pred.empty:
+            lines.append("")
+            lines.append("🔮 <b>Прогноз каскада (OI 7д):</b>")
+            for _, r in below_pred.iterrows():
+                spark = "⚡" if r["price"] in overlap_set else ""
+                lines.append(
+                    f"  <code>${r['price']:,.0f}</code> ({r['dist_pct']:+.1f}%) "
+                    f"— ~{_usd(r['est_usd'])} {spark}"
+                )
+
+    # --- Ближайшее сопротивление шортов ---
+    if not hist.empty:
+        above = hist[hist["price"] > price].nlargest(2, "short_usd")
+        if not above.empty:
+            lines.append("")
+            lines.append("🛡 <b>Шортовые ликвидации (сопротивление):</b>")
+            for _, r in above.sort_values("price").iterrows():
+                lines.append(
+                    f"  <code>${r['price']:,.0f}</code> ({r['dist_pct']:+.1f}%) "
+                    f"— {_usd(r['short_usd'])}"
+                )
+
+    # --- Зоны пересечения ---
+    danger = [lv for lv in liq_result.get("overlap", []) if lv < price]
+    if danger:
+        lines.append("")
+        lines.append("⚡ <b>Зоны повышенного риска (A∩B):</b>")
+        for lv in danger[:4]:
+            lines.append(f"  <code>${lv:,.0f}</code> ({(lv-price)/price*100:+.1f}%)")
+
+    if not has_danger and pred.empty:
+        return None
+
+    lines.append("")
+    lines.append(f"<i>A — OI-drop детекция | B — прогноз по OI 7д</i>")
+    return "\n".join(lines)
+
+
+def broadcast_liq_levels(
+    token: str,
+    subscribers_path: Path,
+    liq_results: List[Dict[str, Any]],
+) -> None:
+    """Рассылает уровни ликвидации подписчикам (без лимита — вызывается раз в 4ч)."""
+    subscribers = load_subscribers(subscribers_path)
+    if not subscribers:
+        return
+
+    messages = []
+    for res in liq_results:
+        msg = build_liq_message(res)
+        if msg:
+            messages.append(msg)
+
+    if not messages:
+        print("Нет данных ликвидаций для отправки.")
+        return
+
+    full_text = "\n\n─────────────────\n\n".join(messages)
+
+    sent = 0
+    for chat_id in subscribers:
+        try:
+            send_telegram_message(token=token, chat_id=chat_id, text=full_text)
+            sent += 1
+        except Exception as exc:
+            print(f"Ошибка отправки ликвидаций подписчику {chat_id}: {exc}")
+
+    if sent:
+        print(f"Отправлены уровни ликвидаций {sent} подписчикам.")
 
 
 def parse_args() -> argparse.Namespace:

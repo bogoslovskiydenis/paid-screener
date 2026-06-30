@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Запуск проекта с реальными данными с Binance."""
+import os
 import sys
 import argparse
 import json
@@ -62,12 +63,57 @@ except ImportError as e:
 
 logger = setup_logger(__name__)
 
+# Интервал отправки ликвидационных уровней в Telegram (секунды)
+_LIQ_SEND_INTERVAL = 4 * 3600        # раз в 4 часа
+_last_liq_send: float = 0.0           # timestamp последней отправки
+
+_MARKET_OVERVIEW_INTERVAL = 3600     # раз в час
+_last_market_overview_send: float = 0.0
+
 FUNDING_USDT_ASSETS = frozenset({"ETH", "SOL", "BTC"})
 ACTIVE_SIGNALS_PATH = Path("data/active_signals.json")
 
 
-def _add_signal_to_tracker(signal: dict) -> None:
-    """Добавляет сгенерированный сигнал в active_signals.json для трекинга TP/SL."""
+def _has_active_sell(asset: str) -> bool:
+    """Есть ли активный SELL-сигнал по этому активу в трекере."""
+    if not ACTIVE_SIGNALS_PATH.exists():
+        return False
+    try:
+        with ACTIVE_SIGNALS_PATH.open("r", encoding="utf-8") as _f:
+            data = json.load(_f)
+        for s in data:
+            if (
+                s.get("asset") == asset
+                and s.get("signal_type") == "SELL"
+                and s.get("status") not in {"TP", "SL", "TSL"}
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _has_active_buy(asset: str) -> bool:
+    """Есть ли уже активная BUY-позиция по этому активу (любой таймфрейм)."""
+    if not ACTIVE_SIGNALS_PATH.exists():
+        return False
+    try:
+        with ACTIVE_SIGNALS_PATH.open("r", encoding="utf-8") as _f:
+            data = json.load(_f)
+        for s in data:
+            if (
+                s.get("asset") == asset
+                and s.get("signal_type") == "BUY"
+                and s.get("status") not in {"TP", "SL", "TSL"}
+            ):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _add_signal_to_tracker(signal: dict) -> bool:
+    """Добавляет сигнал в active_signals.json. Возвращает True если сигнал новый."""
     path = ACTIVE_SIGNALS_PATH
     existing: list = []
     if path.exists():
@@ -91,13 +137,14 @@ def _add_signal_to_tracker(signal: dict) -> None:
             and s.get("status") not in {"TP", "SL", "TSL"}
         ):
             logger.info("[%s/%s] Сигнал уже в трекере, пропускаем", asset, tf)
-            return
+            return False
 
     existing.append(signal)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as _f:
         json.dump(existing, _f, ensure_ascii=False, indent=2, default=str)
     logger.info("[%s/%s] ➕ Сигнал добавлен в трекер (%d активных)", asset, tf, len(existing))
+    return True
 FUNDING_RATE_THRESHOLD = 0.0005
 
 
@@ -371,7 +418,14 @@ def _analyze_timeframe(
             len(signal.get("take_profit", [])),
         )
         c.database.save_signal(signal)
-        _add_signal_to_tracker(signal)
+        is_new = _add_signal_to_tracker(signal)
+        if is_new:
+            if signal.get("signal_type") == "BUY" and _has_active_sell(asset):
+                logger.info("[%s/%s] BUY заблокирован — есть активный SELL по %s", asset, timeframe, asset)
+            elif signal.get("signal_type") == "BUY" and _has_active_buy(asset):
+                logger.info("[%s/%s] BUY заблокирован — %s уже куплен на другом таймфрейме", asset, timeframe, asset)
+            else:
+                _execute_signal(asset, signal, timeframe)
     else:
         logger.info("[%s/%s] Сигнал не сгенерирован (низкая уверенность)", asset, timeframe)
 
@@ -790,6 +844,27 @@ def _export_results(results: dict, args: argparse.Namespace) -> None:
         print(json.dumps(results, indent=2, default=str, ensure_ascii=False))
 
 
+def _execute_signal(asset: str, signal: dict, timeframe: str) -> None:
+    """Передаёт сигнал в Binance executor (paper или real) и уведомляет в Telegram."""
+    if not os.getenv("BINANCE_API_KEY"):
+        return
+    try:
+        from src.trading.binance_executor import execute_signal
+        result = execute_signal(asset=asset, signal=signal, timeframe=timeframe)
+        if result:
+            try:
+                from telegram_bot import broadcast_trade_executed, load_subscribers, TELEGRAM_BOT_TOKEN
+                broadcast_trade_executed(
+                    token=TELEGRAM_BOT_TOKEN,
+                    subscribers_path=Path("data/telegram_subscribers.json"),
+                    trade=result,
+                )
+            except Exception as tg_exc:
+                logger.warning("Ошибка Telegram уведомления об ордере: %s", tg_exc)
+    except Exception as exc:
+        logger.warning("Ошибка Binance executor: %s", exc)
+
+
 def _notify_telegram(
     output_file: str,
     min_confidence: float,
@@ -798,6 +873,7 @@ def _notify_telegram(
     results: Optional[dict] = None,
 ) -> None:
     """Отправляет BUY/SELL и PUMP сигналы в Telegram."""
+    global _last_market_overview_send
     try:
         from telegram_bot import (  # noqa: PLC0415
             broadcast_signals,
@@ -840,13 +916,76 @@ def _notify_telegram(
             )
 
         if results:
-            broadcast_spot_overview(
-                token=TELEGRAM_BOT_TOKEN,
-                subscribers_path=subscribers_path,
-                results=results,
-            )
+            _now = time.time()
+            if _now - _last_market_overview_send >= _MARKET_OVERVIEW_INTERVAL:
+                broadcast_spot_overview(
+                    token=TELEGRAM_BOT_TOKEN,
+                    subscribers_path=subscribers_path,
+                    results=results,
+                )
+                _last_market_overview_send = _now
     except Exception as exc:
         logger.warning("Ошибка уведомления Telegram: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Уровни ликвидации → Telegram (раз в 4 часа)
+# ---------------------------------------------------------------------------
+
+def _maybe_send_liq_levels(components: "_Components") -> None:
+    """Отправляет ликвидационные уровни ETH и BTC в Telegram раз в 4 часа."""
+    global _last_liq_send
+    now = time.time()
+    if now - _last_liq_send < _LIQ_SEND_INTERVAL:
+        return
+
+    try:
+        from src.analytics.liquidation_analyzer import LiquidationAnalyzer
+        from telegram_bot import broadcast_liq_levels, load_subscribers, TELEGRAM_BOT_TOKEN
+        import pandas as pd
+
+        subscribers_path = Path("data/telegram_subscribers.json")
+        if not load_subscribers(subscribers_path):
+            return
+
+        em = components.exchange_manager
+        analyzer = LiquidationAnalyzer()
+        liq_results = []
+
+        for sym, usdt_sym in [("ETH", "ETHUSDT"), ("BTC", "BTCUSDT")]:
+            try:
+                ohlcv_15m = em.get_ohlcv(sym, "15m", limit=200)
+                ohlcv_1h  = em.get_ohlcv(sym, "1h",  limit=168)
+
+                if ohlcv_15m.empty or ohlcv_1h.empty:
+                    continue
+
+                current_price = float(ohlcv_1h["close"].iloc[-1])
+
+                res = analyzer.analyze(
+                    symbol=usdt_sym,
+                    current_price=current_price,
+                    ohlcv_15m=ohlcv_15m,
+                    ohlcv_1h=ohlcv_1h,
+                    hours=48,
+                )
+                liq_results.append(res)
+                time.sleep(0.5)
+
+            except Exception as e:
+                logger.warning("Liq scan %s: %s", sym, e)
+
+        if liq_results:
+            broadcast_liq_levels(
+                token=TELEGRAM_BOT_TOKEN,
+                subscribers_path=subscribers_path,
+                liq_results=liq_results,
+            )
+            _last_liq_send = now
+            logger.info("Ликвидационные уровни отправлены в Telegram.")
+
+    except Exception as exc:
+        logger.warning("_maybe_send_liq_levels: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1040,9 @@ def main() -> None:
                     acc_signals=results.get("_accumulation_signals") or [],
                     results=results,
                 )
+
+            if args.loop:
+                _maybe_send_liq_levels(components)
 
         except KeyboardInterrupt:
             logger.info("Остановлено вручную.")

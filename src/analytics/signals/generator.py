@@ -1027,20 +1027,51 @@ class SignalGenerator:
         max_tp_pct = self._MAX_TP_PCT.get(timeframe, 0.20)
         tp_max = current_price * (1 + max_tp_pct)
 
-        take_profit: List[Dict[str, Any]] = []
-        for i, res in enumerate(sorted(resistance_levels, key=lambda x: x["price"])[:5]):
-            if current_price < res["price"] <= tp_max:
-                take_profit.append({
-                    "level": res["price"],
-                    "probability": max(0.1, 0.6 - i * 0.15),
-                })
+        # Ближайшее сопротивление вычисляем заранее — оно идёт первым TP
+        ns_below = max(
+            (s for s in support_levels if s["price"] < current_price),
+            key=lambda x: x["price"],
+            default=None,
+        )
+        nr_above = min(
+            (r for r in resistance_levels if r["price"] > current_price),
+            key=lambda x: x["price"],
+            default=None,
+        )
 
-        # ATR-based bounce targets — resistance может быть слишком близко
+        take_profit: List[Dict[str, Any]] = []
+
+        # TP1 — ближайшее сопротивление (явный приоритет над ATR-таргетами)
+        if nr_above and current_price < nr_above["price"] <= tp_max:
+            take_profit.append({"level": nr_above["price"], "probability": 0.55})
+
+        # Остальные уровни сопротивления (пропускаем уже добавленный nr_above)
+        for i, res in enumerate(sorted(resistance_levels, key=lambda x: x["price"])[:6]):
+            if not (current_price < res["price"] <= tp_max):
+                continue
+            if nr_above and abs(res["price"] - nr_above["price"]) / nr_above["price"] < 0.005:
+                continue  # дубль nr_above
+            take_profit.append({
+                "level": res["price"],
+                "probability": max(0.1, 0.45 - i * 0.10),
+            })
+
+        # ATR-таргеты — добавляем только если не дублируют уровень сопротивления (±3%)
         if atr > 0:
-            for mult, prob in [(2.0, 0.45), (3.0, 0.30), (4.0, 0.20)]:
+            for mult, prob in [(2.0, 0.40), (3.0, 0.25), (4.0, 0.15)]:
                 atr_target = entry_price + atr * mult
-                if current_price < atr_target <= tp_max:
+                if not (current_price < atr_target <= tp_max):
+                    continue
+                too_close = any(
+                    abs(atr_target - tp["level"]) / atr_target < 0.03
+                    for tp in take_profit
+                    if isinstance(tp.get("level"), (int, float))
+                )
+                if not too_close:
                     take_profit.append({"level": round(atr_target, 8), "probability": prob})
+
+        # Сортируем по цене — ближайшая цель всегда первая
+        take_profit = sorted(take_profit, key=lambda x: x.get("level", float("inf")))
 
         filtered_tp = [tp for tp in take_profit if tp.get("level", 0) > current_price]
         # Отбрасываем слишком близкие цели (R/R < 1) — TP1 не должен быть убыточным
@@ -1085,17 +1116,6 @@ class SignalGenerator:
 
         ema = ema_analysis or {}
         macd = macd_analysis or {}
-
-        ns_below = max(
-            (s for s in support_levels if s["price"] < current_price),
-            key=lambda x: x["price"],
-            default=None,
-        )
-        nr_above = min(
-            (r for r in resistance_levels if r["price"] > current_price),
-            key=lambda x: x["price"],
-            default=None,
-        )
 
         return {
             "signal_type": "BUY",
