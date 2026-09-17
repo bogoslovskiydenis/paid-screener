@@ -1,137 +1,102 @@
 #!/usr/bin/env python3
-"""Постоянный сканер: анализ + отправка сигналов в Telegram с безопасным интервалом."""
+"""Постоянный сканер: анализ + отправка сигналов в Telegram с безопасным интервалом.
 
-import json
-import subprocess
+Раньше каждая итерация запускала run_real.py и telegram_bot.py через subprocess —
+все компоненты (биржи, БД, генератор) пересоздавались на каждый цикл.
+Теперь run_iteration/broadcast_signals вызываются напрямую, компоненты живут
+всё время работы процесса.
+"""
+
+import argparse
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from src.utils.config import load_config, get_assets, get_timeframes
+from src.utils.logger import setup_logger
+from src.runner.components import build_components
+from src.runner.iteration import run_iteration, export_results
+import telegram_bot
 
-
-OUTPUT_FILE = "signals_spot.json"
+CONFIG_PATH = "config/config.yaml"
+OUTPUT_FILE = "data/signals_spot.json"
+SUBSCRIBERS_PATH = Path("data/telegram_subscribers.json")
 INCLUDE_SELL = True
 
+logger = setup_logger(__name__)
 
-def run_analysis() -> Optional[str]:
-    cfg = load_config("config/config.yaml")
-    jobs = [(get_assets(cfg), get_timeframes(cfg), "signals_crypto_tmp.json")]
 
-    combined: Dict[str, Any] = {}
-    have_data = False
-
-    for assets, timeframes, tmp_name in jobs:
-        if not assets:
-            continue
-
-        cmd = [
-            "python3",
-            "run_real.py",
-            "--asset",
-            ",".join(assets),
-            "--timeframes",
-            ",".join(timeframes),
-            "--export-json",
-            "--output",
-            tmp_name,
-        ]
-
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as exc:
-            print(f"Ошибка запуска анализа для {assets}: {exc}")
-            continue
-
-        path = Path(tmp_name)
-        if not path.exists():
-            print(f"Файл с сигналами не найден после анализа: {tmp_name}")
-            continue
-
-        try:
-            part = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"Ошибка чтения файла сигналов {tmp_name}: {exc}")
-            continue
-
-        if not isinstance(part, dict):
-            continue
-
-        for asset, tf_map in part.items():
-            if not isinstance(tf_map, dict):
-                continue
-            dst = combined.setdefault(asset, {})
-            dst.update(tf_map)
-
-        have_data = True
-
-    if not have_data:
-        print("Не удалось получить данные ни по одному активу.")
-        return None
-
-    final_path = Path(OUTPUT_FILE)
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        final_path.write_text(
-            json.dumps(combined, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        print(f"Ошибка записи объединенного файла сигналов: {exc}")
-        return None
-
-    try:
-        return final_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        print(f"Ошибка чтения объединенного файла сигналов: {exc}")
-        return None
+def _build_args(config: dict, min_confidence: float) -> argparse.Namespace:
+    """Namespace в формате CLI-аргументов run_real.py — его ждёт run_iteration."""
+    return argparse.Namespace(
+        asset=",".join(get_assets(config)),
+        timeframes=",".join(get_timeframes(config)),
+        min_confidence=min_confidence,
+        export_json=True,
+        output=OUTPUT_FILE,
+        limit=500,
+        config=CONFIG_PATH,
+        loop=False,
+        loop_interval=0,
+        pump_scan=False,
+    )
 
 
 def send_signals(min_confidence: float) -> None:
-    cmd = [
-        "python3",
-        "telegram_bot.py",
-        "--mode",
-        "send",
-        "--signals-file",
-        OUTPUT_FILE,
-        "--min-confidence",
-        str(min_confidence),
-    ]
-    if INCLUDE_SELL:
-        cmd.append("--include-sell")
-
+    send_args = argparse.Namespace(
+        asset="",
+        timeframes="",
+        include_sell=INCLUDE_SELL,
+        min_confidence=min_confidence,
+    )
     try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as exc:
-        print(f"Ошибка отправки сигналов в Telegram: {exc}")
+        telegram_bot.broadcast_signals(
+            token=telegram_bot.TELEGRAM_BOT_TOKEN,
+            subscribers_path=SUBSCRIBERS_PATH,
+            signals_file=Path(OUTPUT_FILE),
+            args=send_args,
+        )
+    except Exception as exc:
+        logger.error("Ошибка отправки сигналов в Telegram: %s", exc, exc_info=True)
 
 
 def main() -> None:
-    config = load_config("config/config.yaml")
+    config = load_config(CONFIG_PATH)
     interval = config.get("updates", {}).get("interval_seconds", 60)
     min_conf = config.get("analysis", {}).get("signals", {}).get("min_confidence", 0.6)
-    print(f"Интервал обновления: {interval} сек")
-    print(f"Минимальная уверенность сигнала для рассылки: {min_conf}")
+    logger.info("Интервал обновления: %d сек", interval)
+    logger.info("Минимальная уверенность сигнала для рассылки: %s", min_conf)
+
+    args = _build_args(config, min_conf)
+    components = build_components(args, config)
+    logger.info("Компоненты инициализированы")
 
     last_snapshot: Optional[str] = None
 
     while True:
-        snapshot = run_analysis()
-        if snapshot is None:
+        try:
+            config = load_config(CONFIG_PATH)  # активы/ТФ можно менять на лету
+            args = _build_args(config, min_conf)
+            results = run_iteration(args, config, components)
+            export_results(results, args)
+            snapshot = Path(OUTPUT_FILE).read_text(encoding="utf-8")
+        except KeyboardInterrupt:
+            logger.info("Остановлено вручную.")
+            break
+        except Exception as exc:
+            logger.error("Ошибка итерации анализа: %s", exc, exc_info=True)
             time.sleep(interval)
             continue
 
         if snapshot != last_snapshot:
-            print("Сигналы изменились, выполняем рассылку...")
+            logger.info("Сигналы изменились, выполняем рассылку...")
             send_signals(min_confidence=min_conf)
             last_snapshot = snapshot
         else:
-            print("Сигналы не изменились, рассылка пропущена.")
+            logger.info("Сигналы не изменились, рассылка пропущена.")
 
         time.sleep(interval)
 
 
 if __name__ == "__main__":
     main()
-

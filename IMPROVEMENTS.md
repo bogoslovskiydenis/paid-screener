@@ -52,6 +52,10 @@
 | A-2 | `[x]` | `src/main.py` | **`PaidScreener` — устаревший класс.** Удалён. `run.py` перенаправлен на `run_real.main()`. |
 | A-3 | `[x]` | `generator.py:5–27` | **Двойные fallback-импорты** убраны. Оставлены чистые относительные импорты + один fallback только для `setup_logger`. |
 | A-4 | `[x]` | корень проекта | **JSON-файлы сигналов в корне**: дефолтный путь в `run_real.py` и `telegram_bot.py` обновлён на `data/signals.json`. |
+| A-5 | `[x]` | `telegram_bot.py` | **Пайплайн рассылки был скопирован 5 раз** (`broadcast_signals`/`pump`/`accumulation`/`spot_overview`/`liq_levels`). Сведён к `_broadcast_with_quota()` + `_send_to_all()`; `broadcast_liq_levels` получил дневную квоту (страховка от дублей при рестартах), `broadcast_trade_executed` больше не глотает ошибки через `except: pass`. |
+| A-6 | `[x]` | `run_scanner.py` | **subprocess-запуск `run_real.py` и `telegram_bot.py` на каждой итерации** — все компоненты пересоздавались каждый цикл. Заменено прямыми вызовами `run_iteration`/`broadcast_signals`, компоненты создаются один раз. Вывод переехал: `signals_spot.json` → `data/signals_spot.json`. |
+| A-7 | `[x]` | `track_signals.py` | **Захардкоженный `BINANCE_ASSETS`** — устаревший поднабор конфига: сигналы по XRP/SUI/LTC/HBAR/ADA/LINK/AVAX и др. никогда не закрывались. Список теперь читается из `config.yaml` на каждой итерации; manual-сделки (`trade.py`) трекаются всегда. |
+| A-8 | `[x]` | корень проекта | Удалены устаревшие `signals_*.json`/`test_real.json` (выгрузки янв–июн). Добавлен `requirements.lock` (`pip freeze`) — фикс версий против молчаливых поломок при обновлении ccxt/pandas. |
 
 ---
 
@@ -61,7 +65,7 @@
 |---|--------|------|----------|
 | L-1 | `[x]` | `generator.py` | **Volume confirmation улучшен**: 3 условия вместо одного — объём выше нормы, устойчивость (последние 3 свечи), поглощение (объём без движения цены). |
 | L-2 | `[x]` | `track_signals.py` | **Трекер сигналов уже существовал.** Рефакторинг: все `print()` → `logger`, упрощена структура, добавлен `logging.basicConfig` при запуске напрямую. |
-| L-3 | `[ ]` | — | **Нет бэктестинга.** Без проверки исторических сигналов невозможно оценить качество системы. Добавить `src/analytics/backtest.py`. |
+| L-3 | `[x]` | `backtest.py` | **Бэктестинг реализован**: walk-forward по истории Binance, симуляция SL/TP1/таймаут, калибровка confidence vs win rate (пункт был помечен открытым по ошибке). |
 | L-4 | `[ ]` | — | **Нет мультитаймфреймного подтверждения** на уровне генератора. Сигнал на 4h выдаётся без проверки согласованности с 1d. |
 | L-5 | `[x]` | `market_sentiment.py` | **Market Sentiment**: Long/Short Ratio + Open Interest + Funding Rate. Корректирует `confidence` сигнала на ±0.10, встраивается в Telegram-сообщение. |
 
@@ -122,6 +126,10 @@
 | 2026-09-17 | B-9 | Мерж нескольких файлов сигналов в `broadcast_signals` — по таймфреймам, а не по активу целиком | claude |
 | 2026-09-17 | B-10 | Guard'ы на `float(entry_price/stop_loss)` в `collect_buy_signals` и `track_signals`: битый сигнал пропускается с логом | claude |
 | 2026-09-17 | B-11 | `_quota_db_instance: Optional[Database]` вместо `Database \| None` — совместимость с Python 3.9 | claude |
+| 2026-09-17 | A-5 | Единый пайплайн рассылки `_broadcast_with_quota` + `_send_to_all` в `telegram_bot.py`; квота для liq-levels; убран `except: pass` в trade_executed | claude |
+| 2026-09-17 | A-6 | `run_scanner.py` переведён с subprocess на прямые вызовы `run_iteration`/`broadcast_signals`; компоненты создаются один раз; вывод → `data/signals_spot.json` | claude |
+| 2026-09-17 | A-7 | Активы трекера читаются из `config.yaml` вместо захардкоженного `BINANCE_ASSETS`; manual-сделки трекаются всегда | claude |
+| 2026-09-17 | A-8 | Удалены устаревшие `signals_*.json` из корня; добавлен `requirements.lock` | claude |
 
 ---
 

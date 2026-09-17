@@ -13,7 +13,7 @@ import pandas as pd
 
 from src.parsers.exchange_manager import ExchangeManager
 from src.storage.database import Database
-from src.utils.config import Settings
+from src.utils.config import Settings, get_assets, load_config
 from telegram_bot import (
     TELEGRAM_BOT_TOKEN,
     load_subscribers,
@@ -24,7 +24,12 @@ logger = logging.getLogger(__name__)
 
 SUBSCRIBERS_PATH = Path("data/telegram_subscribers.json")
 
-BINANCE_ASSETS = {"ETH", "SOL", "BTC", "BNB", "XLM", "ETH/BTC", "SOL/ETH", "SOL/BTC", "XLM/BTC"}
+CONFIG_PATH = "config/config.yaml"
+
+
+def _tracked_assets() -> set:
+    """Активы для трекинга — из config.yaml, а не из захардкоженного списка."""
+    return {str(a).upper() for a in get_assets(load_config(CONFIG_PATH))}
 
 _TF_SECONDS = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
@@ -222,6 +227,12 @@ def track_signals(interval_seconds: int = 86400) -> None:
 
         logger.info("Проверяем %d активных сигналов...", len(signals))
 
+        try:
+            tracked_assets = _tracked_assets()
+        except Exception as exc:
+            logger.warning("Не удалось загрузить конфиг (%s), используем дефолтный список активов", exc)
+            tracked_assets = {str(a).upper() for a in get_assets({})}
+
         wins = 0
         losses = 0
         total_closed = 0
@@ -237,7 +248,8 @@ def track_signals(interval_seconds: int = 86400) -> None:
                     db.update_active_signal(db_id, data=signal)
                     continue
 
-                if asset.upper() not in BINANCE_ASSETS:
+                # manual-сделки (trade.py) трекаем даже если актива нет в конфиге
+                if asset.upper() not in tracked_assets and timeframe != "manual":
                     db.update_active_signal(db_id, data=signal)
                     continue
 

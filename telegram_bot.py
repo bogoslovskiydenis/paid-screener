@@ -469,6 +469,59 @@ def load_subscribers(path: Path) -> Set[int]:
     return {int(x) for x in data}
 
 
+def _send_to_all(token: str, subscribers: Set[int], text: str, label: str) -> int:
+    """Отправляет текст всем подписчикам, возвращает число успешных отправок."""
+    sent = 0
+    for chat_id in subscribers:
+        try:
+            send_telegram_message(token=token, chat_id=chat_id, text=text)
+            sent += 1
+        except Exception as exc:
+            print(f"{label}: ошибка отправки подписчику {chat_id}: {exc}")
+    return sent
+
+
+def _broadcast_with_quota(
+    token: str,
+    subscribers_path: Path,
+    signals: List[Dict[str, Any]],
+    quota_key_fn,
+    build_fn,
+    label: str,
+    min_confidence: Optional[float] = None,
+) -> None:
+    """Общий пайплайн рассылки: подписчики → фильтр confidence → квоты → сборка → отправка."""
+    subscribers = load_subscribers(subscribers_path)
+    if not subscribers:
+        print(f"{label}: подписчиков нет, рассылать некому.")
+        return
+
+    if min_confidence is not None:
+        signals = [s for s in signals if float(s.get("confidence") or 0.0) >= min_confidence]
+    if not signals:
+        print(f"{label}: нет сигналов с достаточной уверенностью.")
+        return
+
+    qdb = _quota_db()
+    new_signals = [
+        s for s in signals
+        if qdb.quota_can_send(quota_key_fn(s), MAX_SIGNAL_SENDS_PER_DAY, SIGNAL_COOLDOWN_HOURS)
+    ]
+    if not new_signals:
+        print(
+            f"{label}: дневной лимит {MAX_SIGNAL_SENDS_PER_DAY} на актив/ТФ/тип исчерпан "
+            f"или кулдаун {SIGNAL_COOLDOWN_HOURS}ч не прошёл."
+        )
+        return
+
+    message = build_fn(new_signals)
+    sent = _send_to_all(token, subscribers, message, label)
+    if sent > 0:
+        for s in new_signals:
+            qdb.quota_record(quota_key_fn(s))
+    print(f"{label}: отправлено {len(new_signals)} сигналов {sent} подписчикам.")
+
+
 def broadcast_trade_executed(
     token: str,
     subscribers_path: Path,
@@ -517,11 +570,7 @@ def broadcast_trade_executed(
         lines.append("❌ Выходные ордера не выставлены — <b>закрой или защити позицию вручную!</b>")
 
     text = "\n".join(lines)
-    for chat_id in subscribers:
-        try:
-            send_telegram_message(token, chat_id, text)
-        except Exception:
-            pass
+    _send_to_all(token, subscribers, text, "Сделка")
 
 
 def save_subscribers(path: Path, chat_ids: Set[int]) -> None:
@@ -598,11 +647,6 @@ def listen_for_subscribers(token: str, subscribers_path: Path) -> None:
 
 
 def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, args: argparse.Namespace) -> None:
-    subscribers = load_subscribers(subscribers_path)
-    if not subscribers:
-        print("Подписчиков нет, рассылать некому.")
-        return
-
     # поддержка нескольких файлов через запятую
     signal_files = [Path(f.strip()) for f in str(signals_file).split(",") if f.strip()]
     data: Dict[str, Any] = {}
@@ -648,45 +692,17 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
         return
 
     today = date.today().isoformat()
-    qdb = _quota_db()
-    floor = max(float(args.min_confidence), MIN_SIGNAL_CONFIDENCE_REPEAT)
-    new_signals: List[Dict[str, Any]] = []
-    for s in filtered_signals:
-        if float(s.get("confidence") or 0.0) < floor:
-            continue
-        k = daily_quota_key(
+    _broadcast_with_quota(
+        token=token,
+        subscribers_path=subscribers_path,
+        signals=filtered_signals,
+        quota_key_fn=lambda s: daily_quota_key(
             str(s["asset"]), str(s["timeframe"]), str(s.get("signal_type") or ""), today
-        )
-        if not qdb.quota_can_send(k, MAX_SIGNAL_SENDS_PER_DAY, SIGNAL_COOLDOWN_HOURS):
-            continue
-        new_signals.append(s)
-
-    if not new_signals:
-        print(
-            "Нет сигналов для рассылки: дневной лимит "
-            f"{MAX_SIGNAL_SENDS_PER_DAY} на актив/ТФ/тип, кулдаун {SIGNAL_COOLDOWN_HOURS}ч "
-            f"или порог уверенности < {floor:.0%}."
-        )
-        return
-
-    message = build_message(new_signals)
-
-    sent = 0
-    for chat_id in subscribers:
-        try:
-            send_telegram_message(token=token, chat_id=chat_id, text=message)
-            sent += 1
-        except Exception as exc:
-            print(f"Ошибка отправки подписчику {chat_id}: {exc}")
-
-    if sent > 0:
-        for s in new_signals:
-            k = daily_quota_key(
-                str(s["asset"]), str(s["timeframe"]), str(s.get("signal_type") or ""), today
-            )
-            qdb.quota_record(k)
-
-    print(f"Отправлено {len(new_signals)} сигналов {sent} подписчикам.")
+        ),
+        build_fn=build_message,
+        label="Сигналы",
+        min_confidence=max(float(args.min_confidence), MIN_SIGNAL_CONFIDENCE_REPEAT),
+    )
 
 
 def build_pump_message(pump_signals: List[Dict[str, Any]]) -> str:
@@ -782,42 +798,16 @@ def broadcast_accumulation_signals(
     min_confidence: float = 0.55,
 ) -> None:
     """Рассылает сигналы накопления подписчикам."""
-    subscribers = load_subscribers(subscribers_path)
-    if not subscribers:
-        return
-
-    filtered = [s for s in signals if float(s.get("confidence") or 0) >= min_confidence]
-    if not filtered:
-        print("Нет сигналов накопления с достаточной уверенностью.")
-        return
-
     today = date.today().isoformat()
-    qdb = _quota_db()
-    new_signals: List[Dict[str, Any]] = []
-    for s in filtered:
-        k = daily_quota_key(str(s.get("asset", "")), "1d", "ACCUMULATION", today)
-        if qdb.quota_can_send(k, MAX_SIGNAL_SENDS_PER_DAY, SIGNAL_COOLDOWN_HOURS):
-            new_signals.append(s)
-
-    if not new_signals:
-        print("Накопление: дневной лимит исчерпан или кулдаун не прошёл.")
-        return
-
-    message = build_accumulation_message(new_signals)
-    sent = 0
-    for chat_id in subscribers:
-        try:
-            send_telegram_message(token=token, chat_id=chat_id, text=message)
-            sent += 1
-        except Exception as exc:
-            print(f"Ошибка отправки накопления подписчику {chat_id}: {exc}")
-
-    if sent > 0:
-        for s in new_signals:
-            k = daily_quota_key(str(s.get("asset", "")), "1d", "ACCUMULATION", today)
-            qdb.quota_record(k)
-
-    print(f"Отправлено {len(new_signals)} сигналов накопления {sent} подписчикам.")
+    _broadcast_with_quota(
+        token=token,
+        subscribers_path=subscribers_path,
+        signals=signals,
+        quota_key_fn=lambda s: daily_quota_key(str(s.get("asset", "")), "1d", "ACCUMULATION", today),
+        build_fn=build_accumulation_message,
+        label="Накопление",
+        min_confidence=min_confidence,
+    )
 
 
 def broadcast_pump_signals(
@@ -827,44 +817,18 @@ def broadcast_pump_signals(
     min_confidence: float = 0.55,
 ) -> None:
     """Рассылает памп-сигналы альтов всем подписчикам."""
-    subscribers = load_subscribers(subscribers_path)
-    if not subscribers:
-        return
-
-    filtered = [s for s in pump_signals if float(s.get("confidence") or 0) >= min_confidence]
-    if not filtered:
-        print("Нет памп-сигналов с достаточной уверенностью.")
-        return
-
     today = date.today().isoformat()
-    qdb = _quota_db()
-    new_signals: List[Dict[str, Any]] = []
-    for s in filtered:
-        sig_type = s.get("signal_type", "PUMP")
-        k = daily_quota_key(str(s.get("asset", "")), "1h", sig_type, today)
-        if qdb.quota_can_send(k, MAX_SIGNAL_SENDS_PER_DAY, SIGNAL_COOLDOWN_HOURS):
-            new_signals.append(s)
-
-    if not new_signals:
-        print("Памп-сигналы: дневной лимит исчерпан или кулдаун не прошёл.")
-        return
-
-    message = build_pump_message(new_signals)
-    sent = 0
-    for chat_id in subscribers:
-        try:
-            send_telegram_message(token=token, chat_id=chat_id, text=message)
-            sent += 1
-        except Exception as exc:
-            print(f"Ошибка отправки памп-сигнала подписчику {chat_id}: {exc}")
-
-    if sent > 0:
-        for s in new_signals:
-            sig_type = s.get("signal_type", "PUMP")
-            k = daily_quota_key(str(s.get("asset", "")), "1h", sig_type, today)
-            qdb.quota_record(k)
-
-    print(f"Отправлено {len(new_signals)} памп-сигналов {sent} подписчикам.")
+    _broadcast_with_quota(
+        token=token,
+        subscribers_path=subscribers_path,
+        signals=pump_signals,
+        quota_key_fn=lambda s: daily_quota_key(
+            str(s.get("asset", "")), "1h", str(s.get("signal_type", "PUMP")), today
+        ),
+        build_fn=build_pump_message,
+        label="Памп-сигналы",
+        min_confidence=min_confidence,
+    )
 
 
 def build_spot_overview_message(results: Dict[str, Any]) -> Optional[str]:
@@ -990,14 +954,7 @@ def broadcast_spot_overview(
         print("Нет данных для обзора рынка.")
         return
 
-    sent = 0
-    for chat_id in subscribers:
-        try:
-            send_telegram_message(token=token, chat_id=chat_id, text=message)
-            sent += 1
-        except Exception as exc:
-            print(f"Ошибка отправки обзора подписчику {chat_id}: {exc}")
-
+    sent = _send_to_all(token, subscribers, message, "Обзор рынка")
     if sent:
         qdb.quota_record(quota_key)
         count = qdb.quota_count(quota_key)
@@ -1125,33 +1082,30 @@ def broadcast_liq_levels(
     token: str,
     subscribers_path: Path,
     liq_results: List[Dict[str, Any]],
+    max_per_day: int = 6,
 ) -> None:
-    """Рассылает уровни ликвидации подписчикам (без лимита — вызывается раз в 4ч)."""
+    """Рассылает уровни ликвидации. Каденс задаёт вызывающий (раз в 4ч);
+    дневная квота — страховка от дублей при рестартах процесса."""
     subscribers = load_subscribers(subscribers_path)
     if not subscribers:
         return
 
-    messages = []
-    for res in liq_results:
-        msg = build_liq_message(res)
-        if msg:
-            messages.append(msg)
+    quota_key = f"_liq_levels|{date.today().isoformat()}"
+    qdb = _quota_db()
+    if qdb.quota_count(quota_key) >= max_per_day:
+        print(f"Уровни ликвидации уже отправлены {max_per_day} раз сегодня, пропускаем.")
+        return
 
+    messages = [m for m in (build_liq_message(res) for res in liq_results) if m]
     if not messages:
         print("Нет данных ликвидаций для отправки.")
         return
 
     full_text = "\n\n─────────────────\n\n".join(messages)
 
-    sent = 0
-    for chat_id in subscribers:
-        try:
-            send_telegram_message(token=token, chat_id=chat_id, text=full_text)
-            sent += 1
-        except Exception as exc:
-            print(f"Ошибка отправки ликвидаций подписчику {chat_id}: {exc}")
-
+    sent = _send_to_all(token, subscribers, full_text, "Ликвидации")
     if sent:
+        qdb.quota_record(quota_key)
         print(f"Отправлены уровни ликвидаций {sent} подписчикам.")
 
 
