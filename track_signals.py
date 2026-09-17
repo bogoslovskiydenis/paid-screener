@@ -228,171 +228,184 @@ def track_signals(interval_seconds: int = 86400) -> None:
 
         for signal in signals:
             db_id: int = signal["_db_id"]
-            asset = str(signal.get("asset") or "")
-            timeframe = str(signal.get("timeframe") or "")
-            signal_type = str(signal.get("signal_type") or "")
-
-            if not asset or not timeframe or not signal_type:
-                db.update_active_signal(db_id, data=signal)
-                continue
-
-            if asset.upper() not in BINANCE_ASSETS:
-                db.update_active_signal(db_id, data=signal)
-                continue
-
-            tp_level = get_tp_level(signal)
-            if tp_level is None:
-                db.update_active_signal(db_id, data=signal)
-                continue
-
-            entry_price = float(signal["entry_price"])
-            side = signal_type.upper()
-
-            if "best_price" not in signal:
-                signal["best_price"] = entry_price
-
-            fetch_tf = "1h" if timeframe == "manual" else timeframe
-            limit = _candles_needed(fetch_tf, interval_seconds)
             try:
-                df = exchange_manager.get_ohlcv(asset, fetch_tf, limit=limit)
-            except Exception as exc:
-                logger.warning("Ошибка получения цены для %s/%s: %s", asset, timeframe, exc)
-                db.update_active_signal(db_id, data=signal)
-                time.sleep(1.0)
-                continue
+                asset = str(signal.get("asset") or "")
+                timeframe = str(signal.get("timeframe") or "")
+                signal_type = str(signal.get("signal_type") or "")
 
-            if df.empty:
-                db.update_active_signal(db_id, data=signal)
-                continue
+                if not asset or not timeframe or not signal_type:
+                    db.update_active_signal(db_id, data=signal)
+                    continue
 
-            time.sleep(0.4)
+                if asset.upper() not in BINANCE_ASSETS:
+                    db.update_active_signal(db_id, data=signal)
+                    continue
 
-            added_dt = _parse_added_at(signal)
-            tf_sec = _TF_SECONDS.get(fetch_tf, 86400)
+                tp_level = get_tp_level(signal)
+                if tp_level is None:
+                    db.update_active_signal(db_id, data=signal)
+                    continue
 
-            result: Optional[str] = None
-            price: Optional[float] = None
+                try:
+                    entry_price = float(signal["entry_price"])
+                    float(signal["stop_loss"])  # обязателен для calc_trailed_sl
+                except (KeyError, TypeError, ValueError):
+                    logger.warning("[%s/%s] Пропуск: некорректные entry_price/stop_loss", asset, timeframe)
+                    db.update_active_signal(db_id, data=signal)
+                    continue
 
-            for _, candle in df.iterrows():
-                ts = candle.get("timestamp")
-                ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+                side = signal_type.upper()
 
-                if ts_dt is not None:
-                    if ts_dt + timedelta(seconds=tf_sec) <= added_dt:
-                        continue
-                    if ts_dt < added_dt:
-                        price_high = price_low = float(candle["close"])
+                if "best_price" not in signal:
+                    signal["best_price"] = entry_price
+
+                fetch_tf = "1h" if timeframe == "manual" else timeframe
+                limit = _candles_needed(fetch_tf, interval_seconds)
+                try:
+                    df = exchange_manager.get_ohlcv(asset, fetch_tf, limit=limit)
+                except Exception as exc:
+                    logger.warning("Ошибка получения цены для %s/%s: %s", asset, timeframe, exc)
+                    db.update_active_signal(db_id, data=signal)
+                    time.sleep(1.0)
+                    continue
+
+                if df.empty:
+                    db.update_active_signal(db_id, data=signal)
+                    continue
+
+                time.sleep(0.4)
+
+                added_dt = _parse_added_at(signal)
+                tf_sec = _TF_SECONDS.get(fetch_tf, 86400)
+
+                result: Optional[str] = None
+                price: Optional[float] = None
+
+                for _, candle in df.iterrows():
+                    ts = candle.get("timestamp")
+                    ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+
+                    if ts_dt is not None:
+                        if ts_dt + timedelta(seconds=tf_sec) <= added_dt:
+                            continue
+                        if ts_dt < added_dt:
+                            price_high = price_low = float(candle["close"])
+                        else:
+                            price_high = float(candle["high"])
+                            price_low = float(candle["low"])
                     else:
                         price_high = float(candle["high"])
                         price_low = float(candle["low"])
-                else:
-                    price_high = float(candle["high"])
-                    price_low = float(candle["low"])
 
-                prev_best = float(signal["best_price"])
-                signal["best_price"] = (
-                    max(prev_best, price_high) if side == "BUY" else min(prev_best, price_low)
+                    prev_best = float(signal["best_price"])
+                    signal["best_price"] = (
+                        max(prev_best, price_high) if side == "BUY" else min(prev_best, price_low)
+                    )
+
+                    trailed_sl = calc_trailed_sl(signal, float(signal["best_price"]))
+                    signal["trailed_sl"] = trailed_sl
+
+                    result, price = check_hit(
+                        price_high=price_high,
+                        price_low=price_low,
+                        signal_type=signal_type,
+                        tp_level=tp_level,
+                        sl_level=trailed_sl,
+                    )
+
+                    if result == "SL":
+                        if side == "BUY" and trailed_sl > entry_price:
+                            result, price = "TSL", trailed_sl
+                        elif side == "SELL" and trailed_sl < entry_price:
+                            result, price = "TSL", trailed_sl
+
+                    if result is not None:
+                        break
+
+                # trailed_sl отсутствует, если все свечи старше added_at (свежий сигнал на 1d/3d)
+                if "trailed_sl" in signal:
+                    move_pct = (float(signal["trailed_sl"]) - entry_price) / entry_price * 100
+                    logger.info("TSL %s/%s: SL → %.4f (%+.2f%% от входа)", asset, timeframe, float(signal["trailed_sl"]), move_pct)
+
+                if result is None or price is None:
+                    db.update_active_signal(db_id, data=signal)
+                    continue
+
+                signal["status"] = result
+                signal["closed_price"] = price
+
+                test_trade = signal.get("test_trade") or {}
+                risk_usd = float(test_trade.get("risk_usd", 0.0)) if isinstance(test_trade, dict) else 0.0
+                qty = float(test_trade.get("qty", 0.0)) if isinstance(test_trade, dict) else 0.0
+
+                test_pnl_usd = None
+                test_pnl_rr = None
+                if qty > 0 and risk_usd > 0:
+                    pnl = (price - float(signal["entry_price"])) * qty if side == "BUY" else (float(signal["entry_price"]) - price) * qty
+                    test_pnl_usd = pnl
+                    test_pnl_rr = pnl / risk_usd
+                    signal["test_pnl_usd"] = test_pnl_usd
+                    signal["test_pnl_rr"] = test_pnl_rr
+
+                total_closed += 1
+                if result in ("TP", "TSL"):
+                    wins += 1
+                elif result == "SL":
+                    losses += 1
+                win_rate = (wins / total_closed * 100.0) if total_closed > 0 else 0.0
+
+                db.update_active_signal(db_id, data=signal, status=result)
+
+                logger.info(
+                    "Сигнал закрыт: %s/%s %s → %s по цене %.4f | PnL %s",
+                    asset, timeframe, signal_type, result, price,
+                    f"{test_pnl_usd:+.2f}$" if test_pnl_usd is not None else "N/A",
                 )
 
-                trailed_sl = calc_trailed_sl(signal, float(signal["best_price"]))
-                signal["trailed_sl"] = trailed_sl
-
-                result, price = check_hit(
-                    price_high=price_high,
-                    price_low=price_low,
-                    signal_type=signal_type,
-                    tp_level=tp_level,
-                    sl_level=trailed_sl,
-                )
-
-                if result == "SL":
-                    if side == "BUY" and trailed_sl > entry_price:
-                        result, price = "TSL", trailed_sl
-                    elif side == "SELL" and trailed_sl < entry_price:
-                        result, price = "TSL", trailed_sl
-
-                if result is not None:
-                    break
-
-            move_pct = (float(signal["trailed_sl"]) - entry_price) / entry_price * 100
-            logger.info("TSL %s/%s: SL → %.4f (%+.2f%% от входа)", asset, timeframe, float(signal["trailed_sl"]), move_pct)
-
-            if result is None or price is None:
-                db.update_active_signal(db_id, data=signal)
-                continue
-
-            signal["status"] = result
-            signal["closed_price"] = price
-
-            test_trade = signal.get("test_trade") or {}
-            risk_usd = float(test_trade.get("risk_usd", 0.0)) if isinstance(test_trade, dict) else 0.0
-            qty = float(test_trade.get("qty", 0.0)) if isinstance(test_trade, dict) else 0.0
-
-            test_pnl_usd = None
-            test_pnl_rr = None
-            if qty > 0 and risk_usd > 0:
-                pnl = (price - float(signal["entry_price"])) * qty if side == "BUY" else (float(signal["entry_price"]) - price) * qty
-                test_pnl_usd = pnl
-                test_pnl_rr = pnl / risk_usd
-                signal["test_pnl_usd"] = test_pnl_usd
-                signal["test_pnl_rr"] = test_pnl_rr
-
-            total_closed += 1
-            if result in ("TP", "TSL"):
-                wins += 1
-            elif result == "SL":
-                losses += 1
-            win_rate = (wins / total_closed * 100.0) if total_closed > 0 else 0.0
-
-            db.update_active_signal(db_id, data=signal, status=result)
-
-            logger.info(
-                "Сигнал закрыт: %s/%s %s → %s по цене %.4f | PnL %s",
-                asset, timeframe, signal_type, result, price,
-                f"{test_pnl_usd:+.2f}$" if test_pnl_usd is not None else "N/A",
-            )
-
-            try:
-                db.save_trade({
-                    "asset": asset,
-                    "timeframe": timeframe,
-                    "signal_type": signal_type,
-                    "strength": str(signal.get("strength") or ""),
-                    "entry_price": float(signal["entry_price"]),
-                    "exit_price": float(price),
-                    "result": result,
-                    "confidence": float(signal.get("confidence") or 0.0),
-                    "risk_usd": risk_usd if risk_usd > 0 else None,
-                    "qty": qty if qty > 0 else None,
-                    "pnl_usd": test_pnl_usd,
-                    "pnl_rr": test_pnl_rr,
-                    "opened_at": None,
-                    "closed_at": datetime.utcnow(),
-                    "source": "tracker",
-                    "signal_snapshot": {k: v for k, v in signal.items() if k != "_db_id"},
-                })
-            except Exception as exc:
-                logger.error("Ошибка записи сделки в БД: %s", exc)
-
-            text = build_result_message(
-                asset=asset,
-                timeframe=timeframe,
-                signal_type=signal_type,
-                strength=str(signal.get("strength") or ""),
-                result=result,
-                price=price,
-                test_pnl_usd=test_pnl_usd,
-                test_pnl_rr=test_pnl_rr,
-                risk_usd=risk_usd if risk_usd > 0 else None,
-                win_rate=win_rate,
-                total_closed=total_closed,
-                wins=wins,
-            )
-            for chat_id in subscribers:
                 try:
-                    send_telegram_message(token=TELEGRAM_BOT_TOKEN, chat_id=chat_id, text=text)
+                    db.save_trade({
+                        "asset": asset,
+                        "timeframe": timeframe,
+                        "signal_type": signal_type,
+                        "strength": str(signal.get("strength") or ""),
+                        "entry_price": float(signal["entry_price"]),
+                        "exit_price": float(price),
+                        "result": result,
+                        "confidence": float(signal.get("confidence") or 0.0),
+                        "risk_usd": risk_usd if risk_usd > 0 else None,
+                        "qty": qty if qty > 0 else None,
+                        "pnl_usd": test_pnl_usd,
+                        "pnl_rr": test_pnl_rr,
+                        "opened_at": None,
+                        "closed_at": datetime.utcnow(),
+                        "source": "tracker",
+                        "signal_snapshot": {k: v for k, v in signal.items() if k != "_db_id"},
+                    })
                 except Exception as exc:
-                    logger.warning("Ошибка отправки результата %s/%s подписчику %d: %s", asset, timeframe, chat_id, exc)
+                    logger.error("Ошибка записи сделки в БД: %s", exc)
+
+                text = build_result_message(
+                    asset=asset,
+                    timeframe=timeframe,
+                    signal_type=signal_type,
+                    strength=str(signal.get("strength") or ""),
+                    result=result,
+                    price=price,
+                    test_pnl_usd=test_pnl_usd,
+                    test_pnl_rr=test_pnl_rr,
+                    risk_usd=risk_usd if risk_usd > 0 else None,
+                    win_rate=win_rate,
+                    total_closed=total_closed,
+                    wins=wins,
+                )
+                for chat_id in subscribers:
+                    try:
+                        send_telegram_message(token=TELEGRAM_BOT_TOKEN, chat_id=chat_id, text=text)
+                    except Exception as exc:
+                        logger.warning("Ошибка отправки результата %s/%s подписчику %d: %s", asset, timeframe, chat_id, exc)
+            except Exception:
+                # один битый сигнал не должен ронять весь трекер
+                logger.exception("Ошибка обработки сигнала id=%s, пропускаем до следующей итерации", db_id)
 
         # Дневная аналитика — отправляем всем подписчикам
         try:

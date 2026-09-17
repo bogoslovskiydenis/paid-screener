@@ -33,7 +33,7 @@ MAX_SIGNAL_SENDS_PER_DAY = 6
 MIN_SIGNAL_CONFIDENCE_REPEAT = 0.7
 SIGNAL_COOLDOWN_HOURS = 2
 
-_quota_db_instance: Database | None = None
+_quota_db_instance: Optional[Database] = None
 
 
 def _quota_db() -> Database:
@@ -206,6 +206,13 @@ def collect_buy_signals(
             indicators = signal.get("indicators") or {}
             atr = indicators.get("atr")
 
+            try:
+                entry_price = float(signal["entry_price"])
+                stop_loss = float(signal["stop_loss"])
+            except (KeyError, TypeError, ValueError):
+                print(f"Пропуск {asset}/{timeframe}: некорректные entry_price/stop_loss")
+                continue
+
             results.append(
                 {
                     "asset": asset,
@@ -216,8 +223,8 @@ def collect_buy_signals(
                     "warning": signal.get("warning"),
                     "bounce_confirmators": signal.get("bounce_confirmators") or [],
                     "strength": strength,
-                    "entry_price": float(signal.get("entry_price")),
-                    "stop_loss": float(signal.get("stop_loss")),
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
                     "take_profit": signal.get("take_profit", []),
                     "confidence": confidence,
                     "test_trade": test_trade,
@@ -320,7 +327,7 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
         )
 
         lines.append(
-            f"{mode_prefix} {s['asset']} {s['timeframe']}: "
+            f"{mode_prefix} {html.escape(str(s['asset']))} {html.escape(str(s['timeframe']))}: "
             f"{signal_type} ({strength_ru}) "
             f"(conf={s['confidence']:.2f})"
         )
@@ -347,12 +354,12 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
             try:
                 sr_bits.append(f"поддержка {fmt_price(float(sup))}")
             except (TypeError, ValueError):
-                sr_bits.append(f"поддержка {sup}")
+                sr_bits.append(f"поддержка {html.escape(str(sup))}")
         if res is not None:
             try:
                 sr_bits.append(f"сопротивление {fmt_price(float(res))}")
             except (TypeError, ValueError):
-                sr_bits.append(f"сопротивление {res}")
+                sr_bits.append(f"сопротивление {html.escape(str(res))}")
         vc = s.get("volume_confirmation")
         if vc is True:
             sr_bits.append("объём выше среднего (подтверждение)")
@@ -385,10 +392,10 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
         # Блок OVERSOLD_BOUNCE: предупреждение и подтвердители
         if is_bounce:
             warning = s.get("warning") or "⚠️ Контрарианский сигнал: строгий стоп."
-            lines.append(warning)
+            lines.append(html.escape(str(warning)))
             confirmators = s.get("bounce_confirmators") or []
             if confirmators:
-                lines.append("✅ Подтвердители: " + " | ".join(confirmators))
+                lines.append("✅ Подтвердители: " + " | ".join(html.escape(str(c)) for c in confirmators))
 
         # Блок рыночного настроения (L/S Ratio, OI, Funding Rate)
         sentiment = s.get("sentiment") or {}
@@ -407,7 +414,7 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
                 "CROWDED_SHORT": "🟢",
             }.get(sent_label, "⚪")
 
-            sent_parts: List[str] = [f"{sent_emoji} {sent_label}"]
+            sent_parts: List[str] = [f"{sent_emoji} {html.escape(sent_label)}"]
             if long_ratio is not None:
                 sent_parts.append(f"L/S {long_ratio * 100:.0f}% лонги")
             if oi_change is not None:
@@ -421,7 +428,7 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
 
             # Заметки (одна-две строки объяснений)
             for note in (sentiment.get("notes") or [])[:3]:
-                lines.append(f"   └─ {note}")
+                lines.append(f"   └─ {html.escape(str(note))}")
 
         lines.append("")
 
@@ -438,6 +445,11 @@ def send_telegram_message(token: str, chat_id: int, text: str) -> None:
     }
 
     resp = requests.post(url, json=payload, timeout=10)
+    if resp.status_code == 400:
+        # 400 почти всегда = битая HTML-разметка ("can't parse entities");
+        # повторяем без parse_mode, чтобы сообщение всё же дошло
+        payload.pop("parse_mode", None)
+        resp = requests.post(url, json=payload, timeout=10)
     try:
         resp.raise_for_status()
     except Exception as exc:
@@ -597,9 +609,16 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
     for sf in signal_files:
         try:
             chunk = load_signals(sf)
-            data.update(chunk)
         except FileNotFoundError:
             print(f"Файл не найден, пропускаем: {sf}")
+            continue
+        # мерж по таймфреймам: data.update(chunk) затирал бы весь актив,
+        # если он встречается в нескольких файлах с разными ТФ
+        for asset, tf_map in chunk.items():
+            if isinstance(tf_map, dict) and isinstance(data.get(asset), dict):
+                data[asset].update(tf_map)
+            else:
+                data[asset] = tf_map
 
     asset_filter = (
         [a.strip() for a in args.asset.split(",") if a.strip()]

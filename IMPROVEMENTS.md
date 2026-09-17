@@ -26,6 +26,11 @@
 | B-4 | `[x]` | `telegram_bot.py:245` | **Некорректный `_TF_RANK`**: `1M=3` (как `1h`?), `1w=6` < `3d=8`. Исправлено: `5m=1, 15m=2, 1h=3, 4h=5, 1M=6, 3d=7, 1w=8, 1d=10`. |
 | B-5 | `[x]` | `generator.py:317–328` | **TP уровни не отсортированы** по близости к цене. Вероятности 0.7/0.5/0.3 присваиваются случайным уровням, а не ближайшим. |
 | B-6 | `[x]` | `entry_spot_filters.py:122–123` | **Самопротиворечивая логика `rsi_a_ok`**: при RSI=71 `hot_a=True` → `rsi_a_ok=False`, хотя RSI < 72. Упростить до `rsi_a < 70`. |
+| B-7 | `[x]` | `track_signals.py:317` | **`KeyError: 'trailed_sl'` ронял весь трекер**: `trailed_sl` присваивается только в цикле по свечам, а читался безусловно после — свежий сигнал на 1d/3d (все свечи старше `added_at`) обрушивал процесс. Лог TSL теперь условный, обработка каждого сигнала обёрнута в `try/except`. |
+| B-8 | `[x]` | `telegram_bot.py` | **HTML не экранировался в `build_message`** (`warning`, `bounce_confirmators`, `sentiment.notes` и др.) при `parse_mode=HTML` — один символ `<` ломал рассылку для всех подписчиков. Добавлен `html.escape` + повтор без `parse_mode` при ответе 400. |
+| B-9 | `[x]` | `telegram_bot.py:600` | **`data.update(chunk)` затирал таймфреймы** при нескольких `--signals-file`: второй файл перезаписывал весь словарь актива. Мерж теперь на уровне таймфреймов. |
+| B-10 | `[x]` | `telegram_bot.py:219`, `track_signals.py:248` | **Незащищённый `float()` на `entry_price`/`stop_loss`** — один битый сигнал обрушивал всю рассылку/трекер. Добавлены guard'ы: сигнал пропускается с логом. |
+| B-11 | `[x]` | `telegram_bot.py:36` | **`Database \| None` в module-level аннотации** — `TypeError` при импорте на Python 3.9, бот не запускался. Заменено на `Optional[Database]` (аналогично фиксу в `signals_store.py`). |
 
 ---
 
@@ -112,6 +117,11 @@
 | 2026-05-27 | L-2 | `track_signals.py` — рефакторинг: `print()` → `logger`, упрощена структура | claude |
 | 2026-05-27 | Q-4 | Добавлен `AnalysisConfig` dataclass в `config.py`; убраны цепочки `.get()` в `_build_components` | claude |
 | 2026-05-27 | L-5 | Market Sentiment: `market_sentiment.py` + `fetch_long_short_ratio`/`fetch_open_interest` в BinanceParser/ExchangeManager; корректировка confidence ±0.10; блок в Telegram с L/S, OI, FR | claude |
+| 2026-09-17 | B-7 | Трекер больше не падает на `KeyError: 'trailed_sl'`; тело цикла по сигналам обёрнуто в `try/except` — один битый сигнал не роняет процесс | claude |
+| 2026-09-17 | B-8 | `html.escape` для всех динамических строк в `build_message`; в `send_telegram_message` повтор без `parse_mode` при 400 | claude |
+| 2026-09-17 | B-9 | Мерж нескольких файлов сигналов в `broadcast_signals` — по таймфреймам, а не по активу целиком | claude |
+| 2026-09-17 | B-10 | Guard'ы на `float(entry_price/stop_loss)` в `collect_buy_signals` и `track_signals`: битый сигнал пропускается с логом | claude |
+| 2026-09-17 | B-11 | `_quota_db_instance: Optional[Database]` вместо `Database \| None` — совместимость с Python 3.9 | claude |
 
 ---
 

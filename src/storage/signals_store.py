@@ -1,11 +1,12 @@
 """Фасад над active_signals в SQLite."""
+from typing import Optional
 from ..utils.logger import setup_logger
 from ..utils.config import Settings
 from .database import Database
 
 logger = setup_logger(__name__)
 
-_db: Database | None = None
+_db: Optional[Database] = None
 
 
 def _get_db() -> Database:
