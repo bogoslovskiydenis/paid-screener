@@ -6,6 +6,7 @@ import argparse
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -93,8 +94,8 @@ def _has_active_sell(asset: str) -> bool:
     return False
 
 
-def _has_active_buy(asset: str) -> bool:
-    """Есть ли уже активная BUY-позиция по этому активу (любой таймфрейм)."""
+def _has_active_buy(asset: str, exclude_tf: str = "") -> bool:
+    """Есть ли уже активная BUY-позиция по этому активу на ДРУГОМ таймфрейме."""
     if not ACTIVE_SIGNALS_PATH.exists():
         return False
     try:
@@ -105,6 +106,7 @@ def _has_active_buy(asset: str) -> bool:
                 s.get("asset") == asset
                 and s.get("signal_type") == "BUY"
                 and s.get("status") not in {"TP", "SL", "TSL"}
+                and s.get("timeframe") != exclude_tf
             ):
                 return True
     except Exception:
@@ -138,6 +140,9 @@ def _add_signal_to_tracker(signal: dict) -> bool:
         ):
             logger.info("[%s/%s] Сигнал уже в трекере, пропускаем", asset, tf)
             return False
+
+    # Метка времени добавления — трекер проверяет TP/SL только по свечам после неё
+    signal["added_at"] = datetime.utcnow().isoformat()
 
     existing.append(signal)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -422,9 +427,15 @@ def _analyze_timeframe(
         if is_new:
             if signal.get("signal_type") == "BUY" and _has_active_sell(asset):
                 logger.info("[%s/%s] BUY заблокирован — есть активный SELL по %s", asset, timeframe, asset)
-            elif signal.get("signal_type") == "BUY" and _has_active_buy(asset):
+            elif signal.get("signal_type") == "BUY" and _has_active_buy(asset, exclude_tf=timeframe):
                 logger.info("[%s/%s] BUY заблокирован — %s уже куплен на другом таймфрейме", asset, timeframe, asset)
             else:
+                if signal.get("signal_type") == "SELL" and _has_active_buy(asset, exclude_tf=timeframe):
+                    logger.warning(
+                        "[%s/%s] ⚠️ КОНФЛИКТ: SELL (conf=%.0f%%) по %s при открытой BUY-позиции — "
+                        "автопродажа отключена, проверь позицию вручную!",
+                        asset, timeframe, signal.get("confidence", 0) * 100, asset,
+                    )
                 _execute_signal(asset, signal, timeframe)
     else:
         logger.info("[%s/%s] Сигнал не сгенерирован (низкая уверенность)", asset, timeframe)

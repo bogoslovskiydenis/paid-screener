@@ -117,6 +117,24 @@ class SignalGenerator:
                 volume_profile=volume_profile,
             )
 
+        # V-образные развороты/пробои: скорер режет противоречия раннего разворота,
+        # bounce требует RSI<=30, pullback — отката и бычьего EMA50. Ловим свежий импульс.
+        if signal_data is None:
+            signal_data = self._check_momentum_breakout(
+                df=df,
+                current_price=current_price,
+                levels=levels,
+                rsi_analysis=rsi_analysis,
+                candlestick_pattern=candlestick_pattern,
+                atr_value=atr_value,
+                ema_analysis=ema_analysis,
+                macd_analysis=macd_analysis,
+                breakout=breakout,
+                timeframe=timeframe,
+                fibonacci=fibonacci,
+                volume_profile=volume_profile,
+            )
+
         if not signal_data or signal_data["confidence"] < self.min_confidence:
             return None
 
@@ -382,6 +400,21 @@ class SignalGenerator:
                 buy_factors.append(
                     "⚠️ EMA медвежья + нет бычьей структуры — не STRONG (отскок)"
                 )
+            # Гард: очень глубокий нисходящий тренд — цена >35% ниже EMA50.
+            # В таком случае BUY сигнал — это в лучшем случае отскок, но не разворот.
+            # Ограничиваем confidence уровнем MEDIUM (не даём STRONG).
+            ema50_val = float(ema.get("ema50") or 0)
+            if (
+                ema50_val > 0
+                and current_price < ema50_val * 0.65
+                and ema_trend == "BEARISH"
+                and not structure_bullish
+            ):
+                buy_score = min(buy_score, 0.78)
+                buy_factors.append(
+                    f"⚠️ Цена на {(1 - current_price / ema50_val) * 100:.0f}% ниже EMA50 — "
+                    "очень глубокий нисходящий тренд, уверенность снижена"
+                )
             return self._create_buy_signal(
                 df, current_price, buy_score, buy_factors,
                 levels, head_shoulders, volume_confirmation, rsi_analysis,
@@ -487,13 +520,16 @@ class SignalGenerator:
         resistance_levels = levels.get("resistance_levels", [])
         
         entry_price = current_price
-        stop_loss = (current_price - 1.5 * atr_value) if atr_value else current_price * 0.97
+        atr_stop = (current_price - 1.5 * atr_value) if atr_value else current_price * 0.97
+        stop_loss = atr_stop
 
         if support_levels:
             nearest_support = max([s for s in support_levels if s["price"] < current_price],
                                   key=lambda x: x["price"], default=None)
             if nearest_support:
-                stop_loss = nearest_support["price"] * 0.995
+                # ATR-floor: стоп за поддержкой, но не ближе 1.5×ATR — иначе
+                # ближайшая поддержка в 0.5-1% от цены даёт стоп внутри дневного шума
+                stop_loss = min(nearest_support["price"] * 0.995, atr_stop)
 
         tp_max = current_price * (1 + max_tp_pct)
         take_profit = []
@@ -622,13 +658,15 @@ class SignalGenerator:
         resistance_levels = levels.get("resistance_levels", [])
         
         entry_price = current_price
-        stop_loss = (current_price + 1.5 * atr_value) if atr_value else current_price * 1.03
+        atr_stop = (current_price + 1.5 * atr_value) if atr_value else current_price * 1.03
+        stop_loss = atr_stop
 
         if resistance_levels:
             nearest_resistance = min([r for r in resistance_levels if r["price"] > current_price],
                                      key=lambda x: x["price"], default=None)
             if nearest_resistance:
-                stop_loss = nearest_resistance["price"] * 1.005
+                # ATR-floor: стоп за сопротивлением, но не ближе 1.5×ATR (см. BUY)
+                stop_loss = max(nearest_resistance["price"] * 1.005, atr_stop)
 
         tp_min = current_price * (1 - max_tp_pct)
         take_profit = []
@@ -864,15 +902,16 @@ class SignalGenerator:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _check_volume_uptick(self, df: pd.DataFrame) -> bool:
-        """Мягкая проверка объёма для разворотов: достаточно одной растущей свечи.
+        """Объём последней свечи заметно выше среднего за 20 предыдущих.
 
-        В отличие от _check_volume (требует 1.3× avg), здесь смотрим лишь на тренд
-        — хватит одного роста объёма из последних трёх свечей.
+        Мягче, чем _check_volume (1.2× вместо 1.3×), но в отличие от старой
+        версии («хоть один рост из трёх») несёт реальную информацию.
         """
-        if len(df) < 5:
+        if len(df) < 21:
             return False
-        vols = df["volume"].tail(5).values
-        return any(float(vols[-i]) > float(vols[-i - 1]) for i in range(1, 4))
+        vols = df["volume"].tail(21)
+        avg = float(vols.iloc[:-1].mean())
+        return avg > 0 and float(vols.iloc[-1]) >= avg * 1.2
 
     def _check_oversold_bounce(
         self,
@@ -959,7 +998,7 @@ class SignalGenerator:
         volume_uptick = self._check_volume_uptick(df)
         if volume_uptick:
             conf += 0.05
-            confirmators.append("Объём нарастает")
+            confirmators.append("Объём выше среднего")
 
         fib = fibonacci or {}
         if fib.get("in_golden_zone") and fib.get("trend") == "BULLISH":
@@ -969,6 +1008,14 @@ class SignalGenerator:
         if liquidity_grab and liquidity_grab.get("type") == "BULLISH":
             conf += 0.12
             confirmators.append("Liquidity Grab (свип ликвидности)")
+
+        # Штраф за глубокий нисходящий тренд: цена >30% ниже EMA50
+        _ema = ema_analysis or {}
+        _ema50 = float(_ema.get("ema50") or 0)
+        _ema_trend = _ema.get("trend", "NEUTRAL")
+        if _ema50 > 0 and current_price < _ema50 * 0.70 and _ema_trend == "BEARISH":
+            conf -= 0.05
+            confirmators.append(f"⚠️ Цена на {(1 - current_price / _ema50) * 100:.0f}% ниже EMA50 — глубокий нисходящий тренд")
 
         # Нужно минимум 2 подтвердителя для надёжного разворота
         if len(confirmators) < 2:
@@ -1021,8 +1068,11 @@ class SignalGenerator:
         entry_price = current_price
         atr = atr_value or current_price * 0.02
 
-        # Жёсткий стоп — чуть ниже поддержки (ATR × 0.5, а не 1.5 как у BUY)
-        stop_loss = near_support["price"] - atr * 0.5
+        # Жёсткий стоп — чуть ниже поддержки (ATR × 0.5, а не 1.5 как у BUY),
+        # но всегда под минимумом последних свечей: ретест лоя/свипа не должен
+        # выносить позицию до опровержения идеи отскока.
+        recent_low = float(df["low"].tail(5).min())
+        stop_loss = min(near_support["price"] - atr * 0.5, recent_low - atr * 0.25)
 
         max_tp_pct = self._MAX_TP_PCT.get(timeframe, 0.20)
         tp_max = current_price * (1 + max_tp_pct)
@@ -1121,7 +1171,7 @@ class SignalGenerator:
             "signal_type": "BUY",
             "signal_label": "OVERSOLD_BOUNCE",
             "bounce_mode": True,
-            "warning": "⚠️ Контрарианский сигнал: разворот в медвежьем тренде. Строгий стоп.",
+            "warning": "⚠️ Контрарианский сигнал: отскок в нисходящем тренде. Строгий стоп. Это НЕ разворот тренда.",
             "bounce_confirmators": confirmators,
             "strength": strength,
             "entry_price": entry_price,
@@ -1247,7 +1297,7 @@ class SignalGenerator:
             factors.append(f"Свеча: {candlestick_pattern}")
         if self._check_volume_uptick(df):
             conf += 0.04
-            factors.append("Объём нарастает")
+            factors.append("Объём выше среднего")
 
         # Базовый тренд + минимум 2 подтверждения (всего ≥3 фактора)
         if len(factors) < 3:
@@ -1274,6 +1324,126 @@ class SignalGenerator:
         )
         if signal:
             signal["signal_label"] = "TREND_PULLBACK"
+        return signal
+
+    def _check_momentum_breakout(
+        self,
+        df: pd.DataFrame,
+        current_price: float,
+        levels: Dict[str, List[Dict[str, Any]]],
+        rsi_analysis: Dict[str, Any],
+        candlestick_pattern: Optional[str],
+        atr_value: Optional[float] = None,
+        ema_analysis: Optional[Dict[str, Any]] = None,
+        macd_analysis: Optional[Dict[str, Any]] = None,
+        breakout: Optional[Dict[str, Any]] = None,
+        timeframe: str = "",
+        fibonacci: Optional[Dict[str, Any]] = None,
+        volume_profile: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Импульсный вход на пробое (MOMENTUM_BREAKOUT).
+
+        Ловит V-образные развороты и пробои, которые остальные режимы пропускают.
+
+        Условия (все обязательны):
+          1. Свежий импульс: ema_cross BULLISH (EMA9>EMA21);
+             EMA50-тренд может быть ещё медвежьим — это ранний разворот.
+          2. Пробой: бычий BOS/CHoCH (пробой swing high) ИЛИ пробой
+             сопротивления с подтверждением объёмом.
+          3. RSI 55–75: импульс есть, но не экстремальная перекупленность.
+          4. Цена не растянута: не выше 10% от EMA21 (иначе стоп слишком далеко).
+
+        Против EMA50-тренда confidence капается на 0.84 (MEDIUM, не STRONG).
+        """
+        ema = ema_analysis or {}
+        if ema.get("ema_cross") != "BULLISH":
+            return None
+
+        rsi_val = float(rsi_analysis.get("rsi") or 50)
+        if not (55.0 <= rsi_val <= 75.0):
+            return None
+
+        ms = detect_structure(df)
+        bos_up = bool(ms.get("bos") and ms["bos"]["type"] == "BULLISH")
+        choch_up = bool(ms.get("choch") and ms["choch"].get("type") == "BULLISH")
+        brk = breakout or {}
+        brk_up = bool(
+            brk.get("breakout")
+            and brk.get("breakout_direction") == "UP"
+            and brk.get("volume_confirmation")
+        )
+        if not (bos_up or choch_up or brk_up):
+            return None
+
+        ema21 = ema.get("ema21")
+        if not ema21 or current_price > float(ema21) * 1.10:
+            return None
+
+        conf = 0.62
+        factors: List[str] = ["Импульс: бычье пересечение EMA9/21"]
+        if bos_up:
+            conf += 0.08
+            factors.append(f"BOS вверх — пробой swing high {ms['bos'].get('broken_level', 0):.4f}")
+        if choch_up:
+            conf += 0.08
+            factors.append("CHoCH — слом даунтренда (пробой swing high)")
+        if brk_up:
+            conf += 0.08
+            factors.append(f"Пробой сопротивления {brk.get('price', 0):.4f} с объёмом")
+
+        # V-разворот: RSI недавно был у дна и резко восстановился
+        try:
+            rsi_series = self.rsi_calculator.calculate(df)
+            recent_min = float(rsi_series.iloc[-7:-1].min())
+        except Exception:
+            recent_min = rsi_val
+        if recent_min <= 40.0:
+            conf += 0.07
+            factors.append(f"V-разворот: RSI {recent_min:.0f} → {rsi_val:.0f}")
+
+        macd = macd_analysis or {}
+        if macd.get("macd_signal") == "BUY":
+            conf += 0.05
+            factors.append("MACD бычий импульс")
+        if self._check_volume_uptick(df):
+            conf += 0.04
+            factors.append("Объём выше среднего")
+        if candlestick_pattern and any(
+            x in candlestick_pattern
+            for x in ["Hammer", "Bullish Engulfing", "Morning Star"]
+        ):
+            conf += 0.04
+            factors.append(f"Свеча: {candlestick_pattern}")
+        if ema.get("trend") == "BULLISH":
+            conf += 0.05
+            factors.append("EMA50-тренд уже бычий")
+
+        # Пробой + минимум 2 подтверждения (всего ≥3 фактора)
+        if len(factors) < 3:
+            return None
+
+        # Ранний разворот против EMA50 — только MEDIUM
+        conf = min(conf, 0.92 if ema.get("trend") == "BULLISH" else 0.84)
+        if conf < self.min_confidence:
+            return None
+
+        logger.info(
+            "MOMENTUM_BREAKOUT %s: RSI=%.1f импульсный пробой | conf=%.2f | %s",
+            timeframe, rsi_val, conf, ", ".join(factors[1:]),
+        )
+
+        obs = detect_order_blocks(df)
+        signal = self._create_buy_signal(
+            df, current_price, conf, factors, levels,
+            head_shoulders=None, volume_confirmation=self._check_volume(df),
+            rsi_analysis=rsi_analysis, atr_value=atr_value,
+            ema_analysis=ema_analysis, macd_analysis=macd_analysis,
+            max_tp_pct=self._MAX_TP_PCT.get(timeframe, 0.20),
+            vwap_data=self.vwap_calculator.analyze(df),
+            volume_profile=volume_profile, fibonacci=fibonacci, order_blocks=obs,
+        )
+        if signal:
+            signal["signal_label"] = "MOMENTUM_BREAKOUT"
         return signal
 
     def _check_volume(self, df: pd.DataFrame) -> bool:

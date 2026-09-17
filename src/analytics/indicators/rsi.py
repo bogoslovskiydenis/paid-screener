@@ -30,8 +30,10 @@ class RSICalculator:
         close = df["close"]
         delta = close.diff()
         
-        gain = (delta.where(delta > 0, 0)).rolling(window=self.period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=self.period).mean()
+        # Сглаживание Уайлдера (RMA), как в TradingView/биржевых графиках.
+        # Простое rolling().mean() даёт заметно более резкие значения.
+        gain = (delta.where(delta > 0, 0.0)).ewm(alpha=1 / self.period, min_periods=self.period).mean()
+        loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1 / self.period, min_periods=self.period).mean()
         
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))

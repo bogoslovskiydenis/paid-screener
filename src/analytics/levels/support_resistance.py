@@ -31,9 +31,16 @@ class SupportResistanceAnalyzer:
         
         highs = df["high"].values
         lows = df["low"].values
-        
-        resistance_levels = self._find_resistance_levels(highs, df)
-        support_levels = self._find_support_levels(lows, df)
+
+        # Допуск кластеризации масштабируем под волатильность таймфрейма:
+        # фиксированные 0.5% осмысленны для внутридневных ТФ, но на 1d/1w
+        # каждый лоу становился отдельным «уровнем». Берём половину
+        # медианного диапазона свечи, но не меньше базового допуска.
+        median_range = float(np.median((df["high"] - df["low"]) / df["close"]))
+        tolerance = max(self.price_tolerance, median_range * 0.5)
+
+        resistance_levels = self._find_resistance_levels(highs, df, tolerance)
+        support_levels = self._find_support_levels(lows, df, tolerance)
         
         return {
             "support_levels": support_levels,
@@ -43,15 +50,16 @@ class SupportResistanceAnalyzer:
     def _find_resistance_levels(
         self,
         highs: np.ndarray,
-        df: pd.DataFrame
+        df: pd.DataFrame,
+        tolerance: float,
     ) -> List[Dict[str, Any]]:
         """Находит уровни сопротивления."""
         levels = []
         price_groups = defaultdict(list)
-        
+
         for i, high in enumerate(highs):
             for price in price_groups.keys():
-                if abs(high - price) / price <= self.price_tolerance:
+                if abs(high - price) / price <= tolerance:
                     price_groups[price].append(i)
                     break
             else:
@@ -74,15 +82,16 @@ class SupportResistanceAnalyzer:
     def _find_support_levels(
         self,
         lows: np.ndarray,
-        df: pd.DataFrame
+        df: pd.DataFrame,
+        tolerance: float,
     ) -> List[Dict[str, Any]]:
         """Находит уровни поддержки."""
         levels = []
         price_groups = defaultdict(list)
-        
+
         for i, low in enumerate(lows):
             for price in price_groups.keys():
-                if abs(low - price) / price <= self.price_tolerance:
+                if abs(low - price) / price <= tolerance:
                     price_groups[price].append(i)
                     break
             else:

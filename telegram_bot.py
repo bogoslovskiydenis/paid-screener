@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -29,7 +29,7 @@ if not TELEGRAM_BOT_TOKEN:
 
 TELEGRAM_DAILY_SENDS_PATH = Path("data/telegram_daily_sends.json")
 
-MAX_SIGNAL_SENDS_PER_DAY = 2
+MAX_SIGNAL_SENDS_PER_DAY = 6
 MIN_SIGNAL_CONFIDENCE_REPEAT = 0.7
 
 
@@ -37,7 +37,10 @@ def daily_quota_key(asset: str, timeframe: str, signal_type: str, day_iso: str) 
     return f"{asset}|{timeframe}|{signal_type}|{day_iso}"
 
 
-def load_daily_sends(path: Path) -> Dict[str, int]:
+SIGNAL_COOLDOWN_HOURS = 2
+
+
+def load_daily_sends(path: Path) -> Dict[str, Any]:
     today = date.today().isoformat()
     if not path.exists():
         return {}
@@ -48,20 +51,53 @@ def load_daily_sends(path: Path) -> Dict[str, int]:
             return {}
     if not isinstance(raw, dict):
         return {}
-    out: Dict[str, int] = {}
+    out: Dict[str, Any] = {}
     for k, v in raw.items():
-        if not isinstance(k, str) or not isinstance(v, int):
+        if not isinstance(k, str):
             continue
         parts = k.split("|")
-        if len(parts) >= 4 and parts[-1] == today:
+        if len(parts) < 4 or parts[-1] != today:
+            continue
+        # поддержка старого формата (int) и нового (dict)
+        if isinstance(v, int):
+            out[k] = {"count": v, "last_sent": None}
+        elif isinstance(v, dict):
             out[k] = v
     return out
 
 
-def save_daily_sends(path: Path, data: Dict[str, int]) -> None:
+def save_daily_sends(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def quota_count(daily_sends: Dict[str, Any], key: str) -> int:
+    entry = daily_sends.get(key)
+    if entry is None:
+        return 0
+    if isinstance(entry, dict):
+        return int(entry.get("count", 0))
+    return int(entry)
+
+
+def quota_can_send(daily_sends: Dict[str, Any], key: str) -> bool:
+    if quota_count(daily_sends, key) >= MAX_SIGNAL_SENDS_PER_DAY:
+        return False
+    entry = daily_sends.get(key)
+    if entry and isinstance(entry, dict) and entry.get("last_sent"):
+        try:
+            last = datetime.fromisoformat(entry["last_sent"])
+            if datetime.now() - last < timedelta(hours=SIGNAL_COOLDOWN_HOURS):
+                return False
+        except (ValueError, TypeError):
+            pass
+    return True
+
+
+def quota_record(daily_sends: Dict[str, Any], key: str) -> None:
+    count = quota_count(daily_sends, key) + 1
+    daily_sends[key] = {"count": count, "last_sent": datetime.now().isoformat()}
 
 
 def load_signals(path: Path) -> Dict[str, Any]:
@@ -102,9 +138,37 @@ def _btc_blocks_alt_spot_buy(data: Dict[str, Any], anchor_tf: str = "1d", timing
 
 
 def save_active_signals(path: Path, signals: List[Dict[str, Any]]) -> None:
+    """Добавляет новые сигналы к ещё открытым, не затирая их.
+
+    Раньше файл перезаписывался целиком списком новой рассылки, и трекер
+    терял все предыдущие открытые позиции (их TP/SL переставали проверяться).
+    """
+    existing: List[Dict[str, Any]] = []
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                existing = data
+        except (json.JSONDecodeError, OSError):
+            existing = []
+
+    still_open = [s for s in existing if s.get("status") not in {"TP", "SL", "TSL"}]
+
+    def _key(s: Dict[str, Any]) -> tuple:
+        return (str(s.get("asset")), str(s.get("timeframe")), str(s.get("signal_type") or ""))
+
+    # Открытый сигнал по тому же активу/ТФ/типу сохраняем — у него уже есть
+    # состояние трекинга (best_price, trailed_sl); дубль из новой рассылки не пишем.
+    known = {_key(s) for s in still_open}
+    merged = list(still_open)
+    for s in signals:
+        if _key(s) not in known:
+            known.add(_key(s))
+            merged.append(s)
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        json.dump(signals, f, ensure_ascii=False, indent=2)
+        json.dump(merged, f, ensure_ascii=False, indent=2)
 
 
 def collect_buy_signals(
@@ -292,7 +356,7 @@ def build_message(signals: List[Dict[str, Any]]) -> str:
         is_bounce = bool(s.get("bounce_mode"))
 
         if is_bounce:
-            mode_prefix = "[⚡ РАЗВОРОТ / РИСК]"
+            mode_prefix = "[⚡ ОТСКОК / РИСК]"
         elif signal_type == "BUY":
             mode_prefix = "[СПОТ / ПОКУПКА]"
         else:
@@ -512,8 +576,18 @@ def broadcast_trade_executed(
         lines.append(f"TP: ${fmt_price(float(tp))}  (+{tp_pct:.1f}%)")
     if sl:
         sl_pct = abs(entry - float(sl)) / entry * 100 if entry else 0
-        lines.append(f"Справочный SL: ${fmt_price(float(sl))}  (-{sl_pct:.1f}%)")
-    lines.append("Стоп-лосс <b>не выставлен</b> — держим до TP")
+        lines.append(f"SL: ${fmt_price(float(sl))}  (-{sl_pct:.1f}%)")
+
+    # Честный статус выходных ордеров вместо прежнего безусловного
+    # «стоп-лосс не выставлен — держим до TP».
+    if mode == "PAPER":
+        lines.append("<i>PAPER-сделка: TP/SL виртуальные, отслеживаются трекером сигналов</i>")
+    elif trade.get("sl_placed"):
+        lines.append("✅ OCO выставлен: TP + стоп-лосс на бирже")
+    elif trade.get("tp_order"):
+        lines.append("⚠️ Выставлен только TP — <b>позиция без стоп-лосса</b>, поставь SL вручную!")
+    else:
+        lines.append("❌ Выходные ордера не выставлены — <b>закрой или защити позицию вручную!</b>")
 
     text = "\n".join(lines)
     for chat_id in subscribers:
@@ -649,14 +723,15 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
         k = daily_quota_key(
             str(s["asset"]), str(s["timeframe"]), str(s.get("signal_type") or ""), today
         )
-        if daily_sends.get(k, 0) >= MAX_SIGNAL_SENDS_PER_DAY:
+        if not quota_can_send(daily_sends, k):
             continue
         new_signals.append(s)
 
     if not new_signals:
         print(
             "Нет сигналов для рассылки: дневной лимит "
-            f"{MAX_SIGNAL_SENDS_PER_DAY} на актив/ТФ/тип или порог уверенности < {floor:.0%}."
+            f"{MAX_SIGNAL_SENDS_PER_DAY} на актив/ТФ/тип, кулдаун {SIGNAL_COOLDOWN_HOURS}ч "
+            f"или порог уверенности < {floor:.0%}."
         )
         return
 
@@ -682,7 +757,7 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
                 str(s.get("signal_type") or ""),
                 today,
             )
-            daily_sends[k] = daily_sends.get(k, 0) + 1
+            quota_record(daily_sends, k)
         save_daily_sends(TELEGRAM_DAILY_SENDS_PATH, daily_sends)
 
     print(f"Отправлено {len(new_signals)} сигналов {sent} подписчикам.")
@@ -795,11 +870,11 @@ def broadcast_accumulation_signals(
     new_signals: List[Dict[str, Any]] = []
     for s in filtered:
         k = daily_quota_key(str(s.get("asset", "")), "1d", "ACCUMULATION", today)
-        if daily_sends.get(k, 0) < MAX_SIGNAL_SENDS_PER_DAY:
+        if quota_can_send(daily_sends, k):
             new_signals.append(s)
 
     if not new_signals:
-        print("Накопление: дневной лимит исчерпан.")
+        print("Накопление: дневной лимит исчерпан или кулдаун не прошёл.")
         return
 
     message = build_accumulation_message(new_signals)
@@ -814,7 +889,7 @@ def broadcast_accumulation_signals(
     if sent > 0:
         for s in new_signals:
             k = daily_quota_key(str(s.get("asset", "")), "1d", "ACCUMULATION", today)
-            daily_sends[k] = daily_sends.get(k, 0) + 1
+            quota_record(daily_sends, k)
         save_daily_sends(TELEGRAM_DAILY_SENDS_PATH, daily_sends)
 
     print(f"Отправлено {len(new_signals)} сигналов накопления {sent} подписчикам.")
@@ -842,11 +917,11 @@ def broadcast_pump_signals(
     for s in filtered:
         sig_type = s.get("signal_type", "PUMP")
         k = daily_quota_key(str(s.get("asset", "")), "1h", sig_type, today)
-        if daily_sends.get(k, 0) < MAX_SIGNAL_SENDS_PER_DAY:
+        if quota_can_send(daily_sends, k):
             new_signals.append(s)
 
     if not new_signals:
-        print("Памп-сигналы: дневной лимит исчерпан.")
+        print("Памп-сигналы: дневной лимит исчерпан или кулдаун не прошёл.")
         return
 
     message = build_pump_message(new_signals)
@@ -862,7 +937,7 @@ def broadcast_pump_signals(
         for s in new_signals:
             sig_type = s.get("signal_type", "PUMP")
             k = daily_quota_key(str(s.get("asset", "")), "1h", sig_type, today)
-            daily_sends[k] = daily_sends.get(k, 0) + 1
+            quota_record(daily_sends, k)
         save_daily_sends(TELEGRAM_DAILY_SENDS_PATH, daily_sends)
 
     print(f"Отправлено {len(new_signals)} памп-сигналов {sent} подписчикам.")
@@ -1078,6 +1153,23 @@ def build_liq_message(liq_result: Dict[str, Any]) -> Optional[str]:
                     f"— {_usd(r['short_usd'])}"
                 )
 
+    # --- Прогноз шорт-сквиза (топ-4 выше цены) ---
+    pred_short = liq_result.get("pred_short", pd.DataFrame())
+    has_squeeze_fuel = False
+    if not pred_short.empty:
+        above_pred = pred_short[pred_short["price"] > price].head(4)
+        if not above_pred.empty:
+            overlap_above_set = set(liq_result.get("overlap_above", []))
+            lines.append("")
+            lines.append("🚀 <b>Топливо сквиза — шорты выше (OI 7д):</b>")
+            for _, r in above_pred.iterrows():
+                spark = "⚡" if r["price"] in overlap_above_set else ""
+                lines.append(
+                    f"  <code>${r['price']:,.0f}</code> ({r['dist_pct']:+.1f}%) "
+                    f"— ~{_usd(r['est_usd'])} {spark}"
+                )
+            has_squeeze_fuel = True
+
     # --- Зоны пересечения ---
     danger = [lv for lv in liq_result.get("overlap", []) if lv < price]
     if danger:
@@ -1086,7 +1178,14 @@ def build_liq_message(liq_result: Dict[str, Any]) -> Optional[str]:
         for lv in danger[:4]:
             lines.append(f"  <code>${lv:,.0f}</code> ({(lv-price)/price*100:+.1f}%)")
 
-    if not has_danger and pred.empty:
+    squeeze = [lv for lv in liq_result.get("overlap_above", []) if lv > price]
+    if squeeze:
+        lines.append("")
+        lines.append("🚀 <b>Зоны сквиза вверх (A∩B):</b>")
+        for lv in squeeze[:4]:
+            lines.append(f"  <code>${lv:,.0f}</code> ({(lv-price)/price*100:+.1f}%)")
+
+    if not has_danger and pred.empty and not has_squeeze_fuel:
         return None
 
     lines.append("")

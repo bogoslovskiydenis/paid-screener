@@ -5,7 +5,7 @@ import argparse
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,6 +39,31 @@ def _candles_needed(timeframe: str, interval_seconds: int) -> int:
     """Сколько свечей нужно запросить чтобы покрыть весь интервал проверки."""
     tf_sec = _TF_SECONDS.get(timeframe, 3600)
     return max(1, int(interval_seconds / tf_sec) + 1)
+
+
+def _parse_added_at(signal: Dict[str, Any]) -> datetime:
+    """
+    Время добавления сигнала в трекер (naive UTC).
+
+    Критично для проверки TP/SL: свечи, закрывшиеся ДО добавления сигнала,
+    не должны триггерить стоп — иначе минимум старой свечи "закрывает"
+    только что созданный сигнал (реальный баг: BTC/3d закрылся по SL на
+    минимуме, случившемся за день до создания сигнала).
+
+    Если метки нет (старые сигналы) — ставим текущее время и сохраняем.
+    """
+    raw = signal.get("added_at") or signal.get("created_at")
+    if raw:
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except ValueError:
+            pass
+    now = datetime.utcnow()
+    signal["added_at"] = now.isoformat()
+    return now
 
 
 # ---------------------------------------------------------------------------
@@ -272,9 +297,11 @@ def track_signals(interval_seconds: int = 86400) -> None:
             if "best_price" not in signal:
                 signal["best_price"] = entry_price
 
-            limit = _candles_needed(timeframe, interval_seconds)
+            # Ручные позиции (timeframe='manual') отслеживаем по часовым свечам
+            fetch_tf = "1h" if timeframe == "manual" else timeframe
+            limit = _candles_needed(fetch_tf, interval_seconds)
             try:
-                df = exchange_manager.get_ohlcv(asset, timeframe, limit=limit)
+                df = exchange_manager.get_ohlcv(asset, fetch_tf, limit=limit)
             except Exception as exc:
                 logger.warning("Ошибка получения цены для %s/%s: %s", asset, timeframe, exc)
                 updated_signals.append(signal)
@@ -287,13 +314,32 @@ def track_signals(interval_seconds: int = 86400) -> None:
 
             time.sleep(0.4)
 
-            # Проходим все свечи за период в хронологическом порядке
+            # Проходим все свечи за период в хронологическом порядке.
+            # Свечи, закрывшиеся ДО добавления сигнала, пропускаем — их high/low
+            # случились до существования сигнала и не должны триггерить TP/SL.
+            added_dt = _parse_added_at(signal)
+            tf_sec = _TF_SECONDS.get(fetch_tf, 86400)
+
             result: Optional[str] = None
             price: Optional[float] = None
 
             for _, candle in df.iterrows():
-                price_high = float(candle["high"])
-                price_low = float(candle["low"])
+                ts = candle.get("timestamp")
+                ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+
+                if ts_dt is not None:
+                    if ts_dt + timedelta(seconds=tf_sec) <= added_dt:
+                        continue  # свеча целиком до сигнала
+                    if ts_dt < added_dt:
+                        # Свеча, внутри которой создан сигнал: её high/low могли
+                        # случиться до сигнала — честно берём только close
+                        price_high = price_low = float(candle["close"])
+                    else:
+                        price_high = float(candle["high"])
+                        price_low = float(candle["low"])
+                else:
+                    price_high = float(candle["high"])
+                    price_low = float(candle["low"])
 
                 # Обновляем best_price
                 prev_best = float(signal["best_price"])

@@ -29,6 +29,18 @@ BUY сигнал генератора — обязателен для финал
 """
 
 
+_TF_FALLBACK_ORDER = ("4h", "1h", "1d", "3d", "1w", "1M")
+
+
+def _resolve_tf(results: Dict[str, Any], preferred: str) -> str:
+    """Вернуть preferred, если по нему есть данные хоть у одного актива, иначе первый доступный ТФ."""
+    candidates = (preferred,) + tuple(tf for tf in _TF_FALLBACK_ORDER if tf != preferred)
+    for tf in candidates:
+        if any(_blk(results, a, tf) for a in SPOT_USDT_ASSETS):
+            return tf
+    return preferred
+
+
 def _blk(results: Dict[str, Any], asset: str, tf: str) -> Optional[Dict[str, Any]]:
     a = results.get(asset)
     if not isinstance(a, dict):
@@ -279,6 +291,8 @@ def compute_spot_long_bundle(
     timing_tf: str = DEFAULT_TIMING_TF,
     min_confidence: float = 0.7,
 ) -> Dict[str, Any]:
+    anchor_tf = _resolve_tf(results, anchor_tf)
+    timing_tf = _resolve_tf(results, timing_tf)
     scenarios = [
         _score_asset_long(results, a, anchor_tf, timing_tf, min_confidence)
         for a in SPOT_USDT_ASSETS

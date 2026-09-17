@@ -35,6 +35,10 @@ def _liq_long(entry: float, leverage: int) -> float:
     return entry * (1.0 - 1.0 / leverage + _MAINT_MARGIN)
 
 
+def _liq_short(entry: float, leverage: int) -> float:
+    return entry * (1.0 + 1.0 / leverage - _MAINT_MARGIN)
+
+
 def _fmt_usd(v: float) -> str:
     if v >= 1_000_000_000:
         return f"${v / 1_000_000_000:.2f}B"
@@ -210,17 +214,19 @@ class LiquidationAnalyzer:
         ls_df: pd.DataFrame,
         current_price: float,
         bucket_size: float,
-    ) -> pd.DataFrame:
+    ) -> tuple:
         """
-        Оценивает где открытые лонги будут ликвидированы.
+        Оценивает где открытые позиции будут ликвидированы.
 
         1. Находим часы, когда OI рос (новые позиции открывались по цене close).
-        2. L/S ratio даёт долю лонгов среди открытых позиций.
+        2. L/S ratio даёт долю лонгов среди открытых позиций (шорты = 1 - доля).
         3. Для каждого уровня входа считаем цену ликвидации при 5x/10x/20x/50x.
-        4. Аккумулируем USD под риском ниже текущей цены.
+        4. Аккумулируем USD под риском: лонги ниже цены, шорты выше.
+
+        Возвращает (pred_long, pred_short).
         """
         if oi_1h.empty or ohlcv_1h.empty:
-            return pd.DataFrame()
+            return pd.DataFrame(), pd.DataFrame()
 
         price_df = ohlcv_1h.copy()
         if not pd.api.types.is_datetime64_any_dtype(price_df["timestamp"]):
@@ -251,37 +257,53 @@ class LiquidationAnalyzer:
         ].copy()
 
         if additions.empty:
-            return pd.DataFrame()
+            return pd.DataFrame(), pd.DataFrame()
 
-        liq_map: Dict[float, float] = defaultdict(float)
+        long_map:  Dict[float, float] = defaultdict(float)
+        short_map: Dict[float, float] = defaultdict(float)
 
         for _, row in additions.iterrows():
             entry     = float(row["close"])
             oi_added  = float(row["oi_delta"])
             long_frac = float(row.get("longAccount", 0.55))
 
-            if entry > current_price * 1.55:
-                continue  # позиции далеко выше — скорее всего уже закрыты
+            long_oi  = oi_added * long_frac
+            short_oi = oi_added * (1.0 - long_frac)
 
-            long_oi = oi_added * long_frac
+            # Лонги: входы далеко выше цены — скорее всего уже закрыты
+            if entry <= current_price * 1.55:
+                for lev, weight in _LEVERAGE_DIST.items():
+                    liq = _liq_long(entry, lev)
+                    if liq >= current_price:
+                        continue
+                    key = round(liq / bucket_size) * bucket_size
+                    long_map[key] += long_oi * weight
 
-            for lev, weight in _LEVERAGE_DIST.items():
-                liq = _liq_long(entry, lev)
-                if liq >= current_price:
-                    continue
-                key = round(liq / bucket_size) * bucket_size
-                liq_map[key] += long_oi * weight
+            # Шорты: входы далеко ниже цены — скорее всего уже закрыты
+            if entry >= current_price / 1.55:
+                for lev, weight in _LEVERAGE_DIST.items():
+                    liq = _liq_short(entry, lev)
+                    if liq <= current_price:
+                        continue  # такой шорт уже был бы ликвидирован
+                    key = round(liq / bucket_size) * bucket_size
+                    short_map[key] += short_oi * weight
 
-        rows = [
-            {
-                "price":    level,
-                "est_usd":  usd,
-                "dist_pct": (level - current_price) / current_price * 100,
-            }
-            for level, usd in sorted(liq_map.items(), key=lambda x: -x[1])
-            if usd > 0 and level < current_price
-        ]
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
+        def _to_df(liq_map: Dict[float, float], keep) -> pd.DataFrame:
+            rows = [
+                {
+                    "price":    level,
+                    "est_usd":  usd,
+                    "dist_pct": (level - current_price) / current_price * 100,
+                }
+                for level, usd in sorted(liq_map.items(), key=lambda x: -x[1])
+                if usd > 0 and keep(level)
+            ]
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+        return (
+            _to_df(long_map,  lambda lv: lv < current_price),
+            _to_df(short_map, lambda lv: lv > current_price),
+        )
 
     # ─────────────────────────────────────────────────────────────
     # Полный анализ (A + B)
@@ -310,20 +332,29 @@ class LiquidationAnalyzer:
 
         # ── B ──
         pred = pd.DataFrame()
+        pred_short = pd.DataFrame()
         if ohlcv_1h is not None and not ohlcv_1h.empty:
             logger.info(f"[Liq/{symbol}] Variant B: прогнозная карта...")
             oi_1h = self.fetch_oi_history(symbol, period="1h", limit=168)
             ls_df = self.fetch_ls_ratio(symbol, period="1h", limit=168)
-            pred  = self.build_pred_heatmap(
+            pred, pred_short = self.build_pred_heatmap(
                 ohlcv_1h, oi_1h, ls_df, current_price, bucket
             )
 
-        # Пересечение A ∩ B
+        # Пересечение A ∩ B (лонги ниже цены)
         overlap: List[float] = []
         if not hist.empty and not pred.empty:
             overlap = sorted(
                 set(hist["price"].values) & set(pred["price"].values),
                 reverse=True,
+            )
+
+        # Пересечение A ∩ B выше цены (шортовые кластеры → зоны сквиза)
+        overlap_above: List[float] = []
+        if not hist.empty and not pred_short.empty:
+            shorts_hist = hist[hist["short_usd"] > 0]
+            overlap_above = sorted(
+                set(shorts_hist["price"].values) & set(pred_short["price"].values)
             )
 
         return {
@@ -333,7 +364,9 @@ class LiquidationAnalyzer:
             "events_count":  len(events),
             "hist":          hist,
             "pred":          pred,
+            "pred_short":    pred_short,
             "overlap":       overlap,
+            "overlap_above": overlap_above,
         }
 
 
@@ -422,11 +455,40 @@ def format_liq_console(result: Dict[str, Any], top_n: int = 8) -> str:
                 f"{r['dist_pct']:>+5.1f}%  {spark}"
             )
 
+    # ── Вариант B↑ — шорты выше цены ───────────────────────────
+    pred_short = result.get("pred_short", pd.DataFrame())
+    lines.append("\n▸ B↑ — Прогноз шорт-ликвидаций выше цены (топливо сквиза)")
+
+    if pred_short.empty:
+        lines.append("   нет данных")
+    else:
+        above_pred = pred_short[pred_short["price"] > price].head(top_n)
+        max_usd = above_pred["est_usd"].max() if not above_pred.empty else 1.0
+
+        lines.append(f"  {'Уровень':>10}  {'USD под риском':>14}  {'Δ%':>6}")
+        lines.append("  " + "─" * 44)
+
+        for _, r in above_pred.iterrows():
+            bar_n = max(1, int(r["est_usd"] / max_usd * 12))
+            bar   = "█" * bar_n + "░" * (12 - bar_n)
+            spark = "⚡" if r["price"] in set(result.get("overlap_above", [])) else ""
+            lines.append(
+                f"  ${r['price']:>9,.2f}  "
+                f"  [{bar}] {_fmt_usd(r['est_usd']):>8}  "
+                f"{r['dist_pct']:>+5.1f}%  {spark}"
+            )
+
     # ── Пересечения ────────────────────────────────────────────
     danger = [lv for lv in result.get("overlap", []) if lv < price]
     if danger:
         lines.append("\n▸ ⚡ Зоны повышенного риска (A ∩ B):")
         for lv in danger[:5]:
+            lines.append(f"   ${lv:,.2f}  ({(lv-price)/price*100:+.1f}% от цены)")
+
+    squeeze = [lv for lv in result.get("overlap_above", []) if lv > price]
+    if squeeze:
+        lines.append("\n▸ 🚀 Зоны сквиза вверх (A ∩ B↑):")
+        for lv in squeeze[:5]:
             lines.append(f"   ${lv:,.2f}  ({(lv-price)/price*100:+.1f}% от цены)")
 
     return "\n".join(lines)

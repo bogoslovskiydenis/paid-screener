@@ -218,6 +218,31 @@ class Database:
 
             _SIGNAL_COLUMNS = {c.name for c in Signal.__table__.columns}
             signal_data_copy = {k: v for k, v in signal_data_copy.items() if k in _SIGNAL_COLUMNS}
+
+            # Дедуп: тот же сигнал (asset+tf+type) за сегодня обновляем, а не плодим строки —
+            # иначе цикл пересохраняет один сигнал каждую итерацию и статистика по таблице врёт
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            existing = (
+                session.query(Signal)
+                .filter(
+                    Signal.asset == signal_data_copy.get("asset"),
+                    Signal.timeframe == signal_data_copy.get("timeframe"),
+                    Signal.signal_type == signal_data_copy.get("signal_type"),
+                    Signal.created_at >= today_start,
+                )
+                .order_by(Signal.created_at.desc())
+                .first()
+            )
+            if existing is not None:
+                for key, value in signal_data_copy.items():
+                    if key != "id":
+                        setattr(existing, key, value)
+                session.commit()
+                logger.debug(
+                    f"Signal updated (dedup): {signal_data.get('signal_type')} for {signal_data.get('asset')}"
+                )
+                return
+
             signal = Signal(**signal_data_copy)
             session.add(signal)
             session.commit()

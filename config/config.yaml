@@ -1,24 +1,69 @@
 assets:
-  - ETH      # ETH/USDT спот
-  - SOL      # SOL/USDT спот (то же самое, что пара SOL/USDT на Binance)
-  - BTC      # BTC/USDT спот
-  - BNB      # BNB/USDT спот — высокая ликвидность, бета к бирже
-  - XLM      # XLM/USDT спот
-  - XRP      # XRP/USDT спот
-  - SUI      # SUI/USDT спот
-  - LTC      # LTC/USDT спот
-  - HBAR     # HBAR/USDT спот
-  - ADA      # ADA/USDT спот
-  - LINK     # LINK/USDT спот
-  - AVAX     # AVAX/USDT спот
+  # Топ-50 по капитализации (CoinGecko, 2026-08-23), только пары с USDT на Binance spot.
+  # Исключены стейблкоины, токенизированное золото/фонды, обёртки (WBTC и т.п.)
+  # и токены чужих бирж (LEO, OKB, BGB...).
+  - BTC      # Bitcoin
+  - ETH      # Ethereum
+  - XRP      # XRP
+  - BNB      # BNB
+  - SOL      # Solana
+  - TRX      # TRON
+  - DOGE     # Dogecoin
+  - ZEC      # Zcash
+  - LINK     # Chainlink
+  - ADA      # Cardano
+  - XLM      # Stellar
+  - BCH      # Bitcoin Cash
+  - GRAM     # Gram (ex-TON)
+  - LTC      # Litecoin
+  - HBAR     # Hedera
+  - SUI      # Sui
+  - AVAX     # Avalanche
+  - SHIB     # Shiba Inu (мем)
+  - UNI      # Uniswap
+  - NEAR     # NEAR Protocol
+  - TAO      # Bittensor
+  - PUMP     # Pump.fun (мем-платформа)
+  - AAVE     # Aave
+  - WLFI     # World Liberty Financial
+  - ONDO     # Ondo
+  - ASTER    # Aster
+  - PEPE     # Pepe (мем)
+  - MORPHO   # Morpho
+  - DOT      # Polkadot
+  - ENA      # Ethena
+  - SKY      # Sky (ex-Maker)
+  - WLD      # Worldcoin
+  - ICP      # Internet Computer
+  - ETC      # Ethereum Classic
+  - POL      # POL (ex-MATIC)
+  - QNT      # Quant
+  - JST      # JUST
+  - ATOM     # Cosmos
+  - ALGO     # Algorand
+  - RENDER   # Render
+  - JUP      # Jupiter
+  - ARB      # Arbitrum
+  - TRUMP    # Official Trump (мем)
+  - FIL      # Filecoin
+  - ETHFI    # Ether.fi
+  - CAKE     # PancakeSwap
+  - APT      # Aptos
+  - PENGU    # Pudgy Penguins (мем)
+  - DASH     # Dash
+  - CRV      # Curve
+  - HEMI     # Hemi (Bitcoin L2)
+  - ILV      # Illuvium (гейминг)
+  # - HYPE   # HYPE/USDT — нет на Binance spot, включить при появлении пары
+  - "LAB/USDT:USDT"  # LABtrade — на Binance только perpetual (spot нет), качаем свечи с фьючерсов
+  # - XMR    # Monero — делистнут с Binance
+  # - KAS    # Kaspa — нет на Binance spot
   - "ETH/BTC"
   - "SOL/ETH"
   - "SOL/BTC"
   - "XLM/BTC"  # кросс XLM к BTC (спот)
 
 timeframes:
-  - 1h
-  - 4h
   - 1d
   - 3d
   - 1w
