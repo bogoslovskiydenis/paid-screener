@@ -1101,8 +1101,12 @@ def build_liq_message(liq_result: Dict[str, Any]) -> Optional[str]:
             return f"${v/1_000:.0f}K"
         return f"${v:.0f}"
 
+    total_longs = hist[hist["price"] < price]["long_usd"].sum() if not hist.empty else 0.0
+    total_shorts = hist[hist["price"] > price]["short_usd"].sum() if not hist.empty else 0.0
+
     lines = [
         f"📊 <b>Уровни ликвидации {base}</b> | ${price:,.2f}",
+        f"🔴 Лонги под угрозой: <b>{_usd(total_longs)}</b>  |  🟢 Шорты-топливо: <b>{_usd(total_shorts)}</b>",
         "",
     ]
 
