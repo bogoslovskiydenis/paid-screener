@@ -4,7 +4,6 @@ import pandas as pd
 from ..utils.logger import setup_logger
 from ..utils.format_price import fmt_price
 from ..analytics.market_sentiment import analyze_market_sentiment
-from ..analytics.market_structure import detect_structure, detect_order_blocks
 from ..analytics.orderbook_analyzer import analyze_orderbook
 from ..storage.signals_store import has_active_sell, has_active_buy, add_signal_to_tracker
 from ..notifications.telegram_notify import execute_signal
@@ -37,49 +36,6 @@ def analyze_timeframe(
         df["timestamp"].min(), df["timestamp"].max(),
     )
 
-    levels = c.levels_analyzer.find_levels(df)
-    logger.info(
-        "[%s/%s] Уровни: поддержка %d, сопротивление %d",
-        asset, timeframe,
-        len(levels.get("support_levels", [])),
-        len(levels.get("resistance_levels", [])),
-    )
-
-    breakout: dict = {}
-    if levels:
-        breakout = c.levels_analyzer.check_breakout(df, levels, volume_confirmation=True)
-        if breakout.get("breakout"):
-            logger.info(
-                "[%s/%s] ⚠ ПРОБОЙ %s $%s | направление: %s | объём: %s",
-                asset, timeframe,
-                breakout["level_type"].upper(),
-                fmt_price(breakout["price"]),
-                breakout.get("breakout_direction", "N/A"),
-                "✓" if breakout.get("volume_confirmation") else "✗",
-            )
-
-    rsi_analysis = c.rsi_calculator.analyze(df)
-    rsi_value = rsi_analysis.get("rsi")
-    rsi_zone = rsi_analysis.get("rsi_zone", "NEUTRAL")
-    rsi_signal = rsi_analysis.get("rsi_signal", "NEUTRAL")
-    if rsi_value:
-        logger.info("[%s/%s] RSI: %.1f (%s) → %s", asset, timeframe, rsi_value, rsi_zone, rsi_signal)
-
-    pattern = c.candlestick_analyzer.analyze(df)
-    if pattern:
-        logger.info("[%s/%s] Свечной паттерн: %s", asset, timeframe, pattern)
-
-    hs_pattern = c.pattern_analyzer.detect(df)
-    if hs_pattern:
-        logger.info(
-            "[%s/%s] Г&П: %s (%s)",
-            asset, timeframe, hs_pattern["pattern_type"], hs_pattern["pattern_direction"],
-        )
-
-    chart_patterns = c.chart_pattern_detector.detect_all(df)
-    for cp in (chart_patterns or []):
-        logger.info("[%s/%s] Паттерн: %s (%s)", asset, timeframe, cp["pattern_type"], cp["pattern_direction"])
-
     # BTC-фильтр (только для USDT-альтов)
     _btc_buy_allowed = True
     if "/" not in asset and asset in ("ETH", "SOL"):
@@ -102,7 +58,55 @@ def analyze_timeframe(
         if funding_rate is not None:
             logger.info("[%s/%s] Funding Rate: %+.4f%%", asset, timeframe, funding_rate * 100)
 
-    signal = c.signal_generator.generate_signal(asset, timeframe, df)
+    # Запускаем все индикаторы один раз через analyze()
+    analysis = c.signal_generator.analyze(asset, timeframe, df)
+    signal = analysis["signal"]
+    rsi_analysis = analysis["rsi"]
+    levels = analysis["levels"]
+    breakout = analysis["breakout"]
+    pattern = analysis["candlestick_pattern"]
+    hs_pattern = analysis["head_shoulders"]
+    _atr = analysis["atr"]
+    _ema = analysis["ema"]
+    _macd = analysis["macd"]
+    _vwap = analysis["vwap"]
+    _vol_profile = analysis["volume_profile"]
+    _structure = analysis["market_structure"]
+    _order_blocks_all = analysis["order_blocks"]
+
+    # chart_patterns вычисляется отдельно (не входит в SignalGenerator)
+    chart_patterns = c.chart_pattern_detector.detect_all(df)
+
+    # --- Логирование индикаторов ---
+    logger.info(
+        "[%s/%s] Уровни: поддержка %d, сопротивление %d",
+        asset, timeframe,
+        len(levels.get("support_levels", [])),
+        len(levels.get("resistance_levels", [])),
+    )
+    if breakout.get("breakout"):
+        logger.info(
+            "[%s/%s] ⚠ ПРОБОЙ %s $%s | направление: %s | объём: %s",
+            asset, timeframe,
+            breakout["level_type"].upper(),
+            fmt_price(breakout["price"]),
+            breakout.get("breakout_direction", "N/A"),
+            "✓" if breakout.get("volume_confirmation") else "✗",
+        )
+    rsi_value = rsi_analysis.get("rsi")
+    rsi_zone = rsi_analysis.get("rsi_zone", "NEUTRAL")
+    rsi_signal_val = rsi_analysis.get("rsi_signal", "NEUTRAL")
+    if rsi_value:
+        logger.info("[%s/%s] RSI: %.1f (%s) → %s", asset, timeframe, rsi_value, rsi_zone, rsi_signal_val)
+    if pattern:
+        logger.info("[%s/%s] Свечной паттерн: %s", asset, timeframe, pattern)
+    if hs_pattern:
+        logger.info(
+            "[%s/%s] Г&П: %s (%s)",
+            asset, timeframe, hs_pattern["pattern_type"], hs_pattern["pattern_direction"],
+        )
+    for cp in (chart_patterns or []):
+        logger.info("[%s/%s] Паттерн: %s (%s)", asset, timeframe, cp["pattern_type"], cp["pattern_direction"])
 
     if signal and signal.get("signal_type") == "BUY" and not _btc_buy_allowed:
         old_conf = float(signal.get("confidence", 0))
@@ -197,9 +201,6 @@ def analyze_timeframe(
     else:
         logger.info("[%s/%s] Сигнал не сгенерирован (низкая уверенность)", asset, timeframe)
 
-    _atr = c.atr_calculator.get_current(df)
-    _ema = c.ema_calculator.analyze(df)
-    _macd = c.macd_calculator.analyze(df)
     atr_str = f"{_atr:.4f}" if _atr else "N/A"
     logger.info(
         "[%s/%s] ATR=%s | EMA=%s/%s | MACD=%s%s",
@@ -243,7 +244,6 @@ def analyze_timeframe(
                 if (spoofing.get("bid_spoof") or spoofing.get("ask_spoof")) else "",
             )
 
-    _vwap = c.vwap_calculator.analyze(df)
     if _vwap.get("vwap"):
         logger.info(
             "[%s/%s] VWAP=%s (%s, %.1f%%)",
@@ -251,7 +251,6 @@ def analyze_timeframe(
             _vwap["vwap_signal"], _vwap["vwap_distance_pct"],
         )
 
-    _vol_profile = c.volume_profile_calculator.analyze(df)
     if _vol_profile.get("poc"):
         logger.info(
             "[%s/%s] VP: POC=%s | VAH=%s | VAL=%s | %s",
@@ -262,8 +261,7 @@ def analyze_timeframe(
             _vol_profile["price_vs_poc"],
         )
 
-    _structure = detect_structure(df)
-    if _structure["structure"] != "UNKNOWN":
+    if _structure.get("structure", "UNKNOWN") != "UNKNOWN":
         parts = [f"Структура: {_structure['structure']} ({_structure['trend_strength']:.0%})"]
         if _structure.get("bos"):
             parts.append(_structure["bos"]["description"])
@@ -271,8 +269,7 @@ def analyze_timeframe(
             parts.append(_structure["choch"]["description"])
         logger.info("[%s/%s] %s", asset, timeframe, " | ".join(parts))
 
-    _order_blocks = detect_order_blocks(df)
-    active_obs = [ob for ob in _order_blocks if not ob["mitigated"]]
+    active_obs = [ob for ob in _order_blocks_all if not ob["mitigated"]]
     if active_obs:
         for ob in active_obs[:2]:
             logger.info(

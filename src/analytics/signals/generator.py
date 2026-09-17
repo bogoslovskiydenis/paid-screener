@@ -48,9 +48,34 @@ class SignalGenerator:
         df: pd.DataFrame
     ) -> Optional[Dict[str, Any]]:
         """Генерирует торговый сигнал на основе анализа."""
+        return self.analyze(asset, timeframe, df)["signal"]
+
+    def analyze(
+        self,
+        asset: str,
+        timeframe: str,
+        df: pd.DataFrame,
+    ) -> Dict[str, Any]:
+        """Запускает все индикаторы один раз, возвращает сигнал + данные всех индикаторов."""
+        _empty: Dict[str, Any] = {
+            "signal": None,
+            "rsi": {},
+            "levels": {"support_levels": [], "resistance_levels": []},
+            "breakout": {},
+            "candlestick_pattern": None,
+            "head_shoulders": None,
+            "atr": None,
+            "ema": {},
+            "macd": {},
+            "vwap": {},
+            "volume_profile": {},
+            "market_structure": {},
+            "order_blocks": [],
+            "fibonacci": {},
+        }
         if len(df) < 100:
             logger.warning(f"Insufficient data for {asset}/{timeframe}")
-            return None
+            return _empty
 
         current_price = df.iloc[-1]["close"]
 
@@ -65,6 +90,9 @@ class SignalGenerator:
         volume_profile = self.volume_profile_calculator.analyze(df)
         fibonacci = fib_module.analyze(df)
         liquidity_grab = detect_liquidity_grab(df)
+        vwap_data = self.vwap_calculator.analyze(df)
+        market_structure = detect_structure(df)
+        order_blocks = detect_order_blocks(df)
 
         signal_data = self._evaluate_signals(
             df,
@@ -81,6 +109,9 @@ class SignalGenerator:
             volume_profile=volume_profile,
             fibonacci=fibonacci,
             liquidity_grab=liquidity_grab,
+            vwap_data=vwap_data,
+            market_structure=market_structure,
+            order_blocks=order_blocks,
         )
 
         # Если основной скорер ничего не дал — пробуем контрарианский разворот
@@ -115,6 +146,9 @@ class SignalGenerator:
                 timeframe=timeframe,
                 fibonacci=fibonacci,
                 volume_profile=volume_profile,
+                market_structure=market_structure,
+                order_blocks=order_blocks,
+                vwap_data=vwap_data,
             )
 
         # V-образные развороты/пробои: скорер режет противоречия раннего разворота,
@@ -133,21 +167,37 @@ class SignalGenerator:
                 timeframe=timeframe,
                 fibonacci=fibonacci,
                 volume_profile=volume_profile,
+                market_structure=market_structure,
+                order_blocks=order_blocks,
+                vwap_data=vwap_data,
             )
 
-        if not signal_data or signal_data["confidence"] < self.min_confidence:
-            return None
-
-        signal_data.update(
-            {
+        if signal_data and signal_data["confidence"] >= self.min_confidence:
+            signal_data.update({
                 "asset": asset,
                 "timeframe": timeframe,
                 "timestamp": datetime.utcnow(),
                 "current_price": current_price,
-            }
-        )
+            })
+        else:
+            signal_data = None
 
-        return signal_data
+        return {
+            "signal": signal_data,
+            "rsi": rsi_analysis,
+            "levels": levels,
+            "breakout": breakout or {},
+            "candlestick_pattern": candlestick_pattern,
+            "head_shoulders": head_shoulders,
+            "atr": atr_value,
+            "ema": ema_analysis or {},
+            "macd": macd_analysis or {},
+            "vwap": vwap_data or {},
+            "volume_profile": volume_profile or {},
+            "market_structure": market_structure or {},
+            "order_blocks": order_blocks or [],
+            "fibonacci": fibonacci or {},
+        }
     
     # Максимальное расстояние до TP в зависимости от таймфрейма
     _MAX_TP_PCT: Dict[str, float] = {
@@ -177,6 +227,9 @@ class SignalGenerator:
         volume_profile: Optional[Dict[str, Any]] = None,
         fibonacci: Optional[Dict[str, Any]] = None,
         liquidity_grab: Optional[Dict[str, Any]] = None,
+        vwap_data: Optional[Dict[str, Any]] = None,
+        market_structure: Optional[Dict[str, Any]] = None,
+        order_blocks: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Оценивает сигналы и определяет тип."""
         buy_score = 0.0
@@ -287,7 +340,7 @@ class SignalGenerator:
             sell_factors.append("MACD дивергенция: медвежья")
 
         # VWAP
-        vwap_data = self.vwap_calculator.analyze(df)
+        vwap_data = vwap_data if vwap_data is not None else self.vwap_calculator.analyze(df)
         vwap_sig = vwap_data.get("vwap_signal", "NEUTRAL")
         if vwap_sig == "BULLISH":
             buy_score += 0.10
@@ -297,7 +350,7 @@ class SignalGenerator:
             sell_factors.append(f"Цена ниже VWAP ({vwap_data['vwap_distance_pct']:+.1f}%)")
 
         # Market Structure (BOS / CHoCH)
-        ms = detect_structure(df)
+        ms = market_structure if market_structure is not None else detect_structure(df)
         if ms.get("bos"):
             if ms["bos"]["type"] == "BULLISH":
                 buy_score += 0.15
@@ -314,7 +367,7 @@ class SignalGenerator:
                 sell_factors.append("CHoCH: разворот вниз")
 
         # Order Blocks
-        obs = detect_order_blocks(df)
+        obs = order_blocks if order_blocks is not None else detect_order_blocks(df)
         active_bull_ob = [ob for ob in obs if ob["type"] == "BULLISH" and not ob["mitigated"]]
         active_bear_ob = [ob for ob in obs if ob["type"] == "BEARISH" and not ob["mitigated"]]
         if active_bull_ob:
@@ -1213,6 +1266,9 @@ class SignalGenerator:
         timeframe: str = "",
         fibonacci: Optional[Dict[str, Any]] = None,
         volume_profile: Optional[Dict[str, Any]] = None,
+        market_structure: Optional[Dict[str, Any]] = None,
+        order_blocks: Optional[List[Dict[str, Any]]] = None,
+        vwap_data: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Трендовый вход на откате (TREND_PULLBACK).
 
@@ -1236,7 +1292,7 @@ class SignalGenerator:
         if not (40.0 <= rsi_val <= 62.0):
             return None
 
-        ms = detect_structure(df)
+        ms = market_structure if market_structure is not None else detect_structure(df)
         bos_up = bool(ms.get("bos") and ms["bos"]["type"] == "BULLISH")
         struct_bull = ms.get("structure") == "BULLISH"
         if not (bos_up or struct_bull):
@@ -1312,14 +1368,14 @@ class SignalGenerator:
             timeframe, rsi_val, conf, ", ".join(factors[1:]),
         )
 
-        obs = detect_order_blocks(df)
+        obs = order_blocks if order_blocks is not None else detect_order_blocks(df)
         signal = self._create_buy_signal(
             df, current_price, conf, factors, levels,
             head_shoulders=None, volume_confirmation=self._check_volume(df),
             rsi_analysis=rsi_analysis, atr_value=atr_value,
             ema_analysis=ema_analysis, macd_analysis=macd_analysis,
             max_tp_pct=self._MAX_TP_PCT.get(timeframe, 0.20),
-            vwap_data=self.vwap_calculator.analyze(df),
+            vwap_data=(vwap_data or self.vwap_calculator.analyze(df)),
             volume_profile=volume_profile, fibonacci=fibonacci, order_blocks=obs,
         )
         if signal:
@@ -1340,6 +1396,9 @@ class SignalGenerator:
         timeframe: str = "",
         fibonacci: Optional[Dict[str, Any]] = None,
         volume_profile: Optional[Dict[str, Any]] = None,
+        market_structure: Optional[Dict[str, Any]] = None,
+        order_blocks: Optional[List[Dict[str, Any]]] = None,
+        vwap_data: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Импульсный вход на пробое (MOMENTUM_BREAKOUT).
 
@@ -1363,7 +1422,7 @@ class SignalGenerator:
         if not (55.0 <= rsi_val <= 75.0):
             return None
 
-        ms = detect_structure(df)
+        ms = market_structure if market_structure is not None else detect_structure(df)
         bos_up = bool(ms.get("bos") and ms["bos"]["type"] == "BULLISH")
         choch_up = bool(ms.get("choch") and ms["choch"].get("type") == "BULLISH")
         brk = breakout or {}
@@ -1432,14 +1491,14 @@ class SignalGenerator:
             timeframe, rsi_val, conf, ", ".join(factors[1:]),
         )
 
-        obs = detect_order_blocks(df)
+        obs = order_blocks if order_blocks is not None else detect_order_blocks(df)
         signal = self._create_buy_signal(
             df, current_price, conf, factors, levels,
             head_shoulders=None, volume_confirmation=self._check_volume(df),
             rsi_analysis=rsi_analysis, atr_value=atr_value,
             ema_analysis=ema_analysis, macd_analysis=macd_analysis,
             max_tp_pct=self._MAX_TP_PCT.get(timeframe, 0.20),
-            vwap_data=self.vwap_calculator.analyze(df),
+            vwap_data=(vwap_data or self.vwap_calculator.analyze(df)),
             volume_profile=volume_profile, fibonacci=fibonacci, order_blocks=obs,
         )
         if signal:
