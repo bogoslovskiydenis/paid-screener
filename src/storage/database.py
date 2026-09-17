@@ -1,8 +1,8 @@
 """Модуль для работы с базой данных."""
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean, JSON, Text
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean, JSON, Text, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Optional, List, Dict, Any
 import pandas as pd
 from ..utils.logger import setup_logger
@@ -107,7 +107,7 @@ class Trade(Base):
 class Breakout(Base):
     """Модель для пробоев уровней."""
     __tablename__ = "breakouts"
-    
+
     id = Column(Integer, primary_key=True)
     asset = Column(String, nullable=False, index=True)
     timeframe = Column(String, nullable=False, index=True)
@@ -120,11 +120,41 @@ class Breakout(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ActiveSignal(Base):
+    """Активные сигналы (заменяет active_signals.json)."""
+    __tablename__ = "active_signals"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    asset = Column(String, nullable=False, index=True)
+    timeframe = Column(String, nullable=False, index=True)
+    signal_type = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=True, index=True)   # NULL = open
+    added_at = Column(DateTime, default=datetime.utcnow, index=True)
+    data = Column(JSON, nullable=False)                  # полный dict сигнала
+
+
+class TelegramQuota(Base):
+    """Дневные квоты рассылки (заменяет telegram_daily_sends.json)."""
+    __tablename__ = "telegram_quota"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String, nullable=False, unique=True, index=True)
+    count = Column(Integer, nullable=False, default=0)
+    last_sent = Column(DateTime, nullable=True)
+    day_iso = Column(String, nullable=False, index=True)
+
+
 class Database:
     """Класс для работы с базой данных."""
-    
+
     def __init__(self, database_url: str):
         self.engine = create_engine(database_url, echo=False)
+        if database_url.startswith("sqlite"):
+            @event.listens_for(self.engine, "connect")
+            def _set_wal(dbapi_conn, _record):
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA journal_mode=WAL")
+                cur.close()
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
         logger.info(f"Database initialized: {database_url}")
@@ -464,6 +494,186 @@ class Database:
                     }
                 )
             return out
+        finally:
+            session.close()
+
+    # ------------------------------------------------------------------
+    # Active signals
+    # ------------------------------------------------------------------
+
+    def add_active_signal(self, signal: dict) -> bool:
+        """Добавляет сигнал в active_signals. Возвращает True если новый."""
+        session = self.get_session()
+        try:
+            asset = signal.get("asset")
+            tf = signal.get("timeframe")
+            stype = signal.get("signal_type")
+            exists = (
+                session.query(ActiveSignal)
+                .filter(
+                    ActiveSignal.asset == asset,
+                    ActiveSignal.timeframe == tf,
+                    ActiveSignal.signal_type == stype,
+                    ActiveSignal.status.is_(None),
+                )
+                .first()
+            )
+            if exists:
+                return False
+            now = datetime.utcnow()
+            signal["added_at"] = now.isoformat()
+            row = ActiveSignal(
+                asset=asset,
+                timeframe=tf,
+                signal_type=stype,
+                status=None,
+                added_at=now,
+                data=dict(signal),
+            )
+            session.add(row)
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def has_active_sell(self, asset: str) -> bool:
+        session = self.get_session()
+        try:
+            return (
+                session.query(ActiveSignal)
+                .filter(
+                    ActiveSignal.asset == asset,
+                    ActiveSignal.signal_type == "SELL",
+                    ActiveSignal.status.is_(None),
+                )
+                .first() is not None
+            )
+        finally:
+            session.close()
+
+    def has_active_buy(self, asset: str, exclude_tf: str = "") -> bool:
+        session = self.get_session()
+        try:
+            q = session.query(ActiveSignal).filter(
+                ActiveSignal.asset == asset,
+                ActiveSignal.signal_type == "BUY",
+                ActiveSignal.status.is_(None),
+            )
+            if exclude_tf:
+                q = q.filter(ActiveSignal.timeframe != exclude_tf)
+            return q.first() is not None
+        finally:
+            session.close()
+
+    def get_open_signals(self) -> List[Dict[str, Any]]:
+        """Возвращает все открытые сигналы; каждый dict содержит _db_id."""
+        session = self.get_session()
+        try:
+            rows = (
+                session.query(ActiveSignal)
+                .filter(ActiveSignal.status.is_(None))
+                .order_by(ActiveSignal.added_at.asc())
+                .all()
+            )
+            result = []
+            for row in rows:
+                d = dict(row.data) if row.data else {}
+                d["_db_id"] = row.id
+                if not d.get("added_at") and row.added_at:
+                    d["added_at"] = row.added_at.isoformat()
+                result.append(d)
+            return result
+        finally:
+            session.close()
+
+    def update_active_signal(
+        self,
+        db_id: int,
+        data: dict,
+        status: Optional[str] = None,
+    ) -> None:
+        """Обновляет данные сигнала; если status задан — закрывает его."""
+        session = self.get_session()
+        try:
+            row = session.query(ActiveSignal).filter(ActiveSignal.id == db_id).first()
+            if row:
+                row.data = {k: v for k, v in data.items() if k != "_db_id"}
+                if status is not None:
+                    row.status = status
+                session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def today_closed_count(self) -> int:
+        """Количество сделок, закрытых сегодня."""
+        session = self.get_session()
+        try:
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            return session.query(Trade).filter(Trade.closed_at >= today_start).count()
+        finally:
+            session.close()
+
+    # ------------------------------------------------------------------
+    # Telegram quota
+    # ------------------------------------------------------------------
+
+    def quota_can_send(self, key: str, max_per_day: int = 6, cooldown_hours: int = 2) -> bool:
+        session = self.get_session()
+        try:
+            today = date.today().isoformat()
+            row = (
+                session.query(TelegramQuota)
+                .filter(TelegramQuota.key == key, TelegramQuota.day_iso == today)
+                .first()
+            )
+            if row is None:
+                return True
+            if row.count >= max_per_day:
+                return False
+            if row.last_sent and datetime.utcnow() - row.last_sent < timedelta(hours=cooldown_hours):
+                return False
+            return True
+        finally:
+            session.close()
+
+    def quota_record(self, key: str) -> None:
+        session = self.get_session()
+        try:
+            today = date.today().isoformat()
+            row = (
+                session.query(TelegramQuota)
+                .filter(TelegramQuota.key == key, TelegramQuota.day_iso == today)
+                .first()
+            )
+            if row:
+                row.count += 1
+                row.last_sent = datetime.utcnow()
+            else:
+                row = TelegramQuota(key=key, count=1, last_sent=datetime.utcnow(), day_iso=today)
+                session.add(row)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def quota_count(self, key: str) -> int:
+        session = self.get_session()
+        try:
+            today = date.today().isoformat()
+            row = (
+                session.query(TelegramQuota)
+                .filter(TelegramQuota.key == key, TelegramQuota.day_iso == today)
+                .first()
+            )
+            return row.count if row else 0
         finally:
             session.close()
 

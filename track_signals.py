@@ -22,9 +22,7 @@ from telegram_bot import (
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_SIGNALS_PATH = Path("data/active_signals.json")
 SUBSCRIBERS_PATH = Path("data/telegram_subscribers.json")
-STATS_PATH = Path("data/trade_stats.json")
 
 BINANCE_ASSETS = {"ETH", "SOL", "BTC", "BNB", "XLM", "ETH/BTC", "SOL/ETH", "SOL/BTC", "XLM/BTC"}
 
@@ -66,43 +64,6 @@ def _parse_added_at(signal: Dict[str, Any]) -> datetime:
     return now
 
 
-# ---------------------------------------------------------------------------
-# Файловые операции
-# ---------------------------------------------------------------------------
-
-def load_active_signals(path: Path) -> List[Dict[str, Any]]:
-    if not path.exists():
-        return []
-    with path.open("r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError:
-            return []
-    return data if isinstance(data, list) else []
-
-
-def save_active_signals(path: Path, signals: List[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(signals, f, ensure_ascii=False, indent=2)
-
-
-def load_stats(path: Path) -> Dict[str, Any]:
-    default: Dict[str, Any] = {"total_closed": 0, "wins": 0, "losses": 0, "win_rate": 0.0}
-    if not path.exists():
-        return default
-    with path.open("r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError:
-            return default
-    return data if isinstance(data, dict) else default
-
-
-def save_stats(path: Path, stats: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +123,7 @@ def check_hit(
     return None, None
 
 
-def build_daily_analytics_message(db: Database, stats: Dict[str, Any]) -> str:
+def build_daily_analytics_message(db: Database) -> str:
     """Формирует суточный отчёт по сигналам для Telegram."""
     analytics = db.get_trade_analytics()
     total = analytics.get("total", 0)
@@ -198,8 +159,7 @@ def build_daily_analytics_message(db: Database, stats: Dict[str, Any]) -> str:
         for tf, s in sorted(by_tf.items()):
             lines.append(f"  {tf}: {s['win_rate']:.0f}%  {s['wins']}W/{s['losses']}L")
 
-    # Сегодня закрытые (из json-статистики)
-    day_closed = int(stats.get("total_closed", 0) or 0)
+    day_closed = db.today_closed_count()
     if day_closed:
         lines.append(f"\nЗа сегодня закрыто: <b>{day_closed}</b> сделок")
 
@@ -254,7 +214,7 @@ def track_signals(interval_seconds: int = 86400) -> None:
     logger.info("Трекер сигналов запущен. Интервал: %.1f ч.", hours)
 
     while True:
-        signals = load_active_signals(ACTIVE_SIGNALS_PATH)
+        signals = db.get_open_signals()
         if not signals:
             logger.debug("Нет активных сигналов, ожидание...")
             time.sleep(interval_seconds)
@@ -262,33 +222,27 @@ def track_signals(interval_seconds: int = 86400) -> None:
 
         logger.info("Проверяем %d активных сигналов...", len(signals))
 
-        updated_signals: List[Dict[str, Any]] = []
-        stats = load_stats(STATS_PATH)
-        total_closed = int(stats.get("total_closed", 0) or 0)
-        wins = int(stats.get("wins", 0) or 0)
-        losses = int(stats.get("losses", 0) or 0)
+        wins = 0
+        losses = 0
+        total_closed = 0
 
         for signal in signals:
-            # Уже закрытый — просто переносим
-            if signal.get("status") in {"TP", "SL", "TSL"}:
-                updated_signals.append(signal)
-                continue
-
+            db_id: int = signal["_db_id"]
             asset = str(signal.get("asset") or "")
             timeframe = str(signal.get("timeframe") or "")
             signal_type = str(signal.get("signal_type") or "")
 
             if not asset or not timeframe or not signal_type:
-                updated_signals.append(signal)
+                db.update_active_signal(db_id, data=signal)
                 continue
 
             if asset.upper() not in BINANCE_ASSETS:
-                updated_signals.append(signal)
+                db.update_active_signal(db_id, data=signal)
                 continue
 
             tp_level = get_tp_level(signal)
             if tp_level is None:
-                updated_signals.append(signal)
+                db.update_active_signal(db_id, data=signal)
                 continue
 
             entry_price = float(signal["entry_price"])
@@ -297,26 +251,22 @@ def track_signals(interval_seconds: int = 86400) -> None:
             if "best_price" not in signal:
                 signal["best_price"] = entry_price
 
-            # Ручные позиции (timeframe='manual') отслеживаем по часовым свечам
             fetch_tf = "1h" if timeframe == "manual" else timeframe
             limit = _candles_needed(fetch_tf, interval_seconds)
             try:
                 df = exchange_manager.get_ohlcv(asset, fetch_tf, limit=limit)
             except Exception as exc:
                 logger.warning("Ошибка получения цены для %s/%s: %s", asset, timeframe, exc)
-                updated_signals.append(signal)
+                db.update_active_signal(db_id, data=signal)
                 time.sleep(1.0)
                 continue
 
             if df.empty:
-                updated_signals.append(signal)
+                db.update_active_signal(db_id, data=signal)
                 continue
 
             time.sleep(0.4)
 
-            # Проходим все свечи за период в хронологическом порядке.
-            # Свечи, закрывшиеся ДО добавления сигнала, пропускаем — их high/low
-            # случились до существования сигнала и не должны триггерить TP/SL.
             added_dt = _parse_added_at(signal)
             tf_sec = _TF_SECONDS.get(fetch_tf, 86400)
 
@@ -329,10 +279,8 @@ def track_signals(interval_seconds: int = 86400) -> None:
 
                 if ts_dt is not None:
                     if ts_dt + timedelta(seconds=tf_sec) <= added_dt:
-                        continue  # свеча целиком до сигнала
+                        continue
                     if ts_dt < added_dt:
-                        # Свеча, внутри которой создан сигнал: её high/low могли
-                        # случиться до сигнала — честно берём только close
                         price_high = price_low = float(candle["close"])
                     else:
                         price_high = float(candle["high"])
@@ -341,13 +289,11 @@ def track_signals(interval_seconds: int = 86400) -> None:
                     price_high = float(candle["high"])
                     price_low = float(candle["low"])
 
-                # Обновляем best_price
                 prev_best = float(signal["best_price"])
                 signal["best_price"] = (
                     max(prev_best, price_high) if side == "BUY" else min(prev_best, price_low)
                 )
 
-                # Trailing SL
                 trailed_sl = calc_trailed_sl(signal, float(signal["best_price"]))
                 signal["trailed_sl"] = trailed_sl
 
@@ -359,7 +305,6 @@ def track_signals(interval_seconds: int = 86400) -> None:
                     sl_level=trailed_sl,
                 )
 
-                # SL в прибыли → TSL (тоже победа)
                 if result == "SL":
                     if side == "BUY" and trailed_sl > entry_price:
                         result, price = "TSL", trailed_sl
@@ -367,19 +312,18 @@ def track_signals(interval_seconds: int = 86400) -> None:
                         result, price = "TSL", trailed_sl
 
                 if result is not None:
-                    break  # сигнал закрыт на этой свече — дальше не идём
+                    break
 
             move_pct = (float(signal["trailed_sl"]) - entry_price) / entry_price * 100
             logger.info("TSL %s/%s: SL → %.4f (%+.2f%% от входа)", asset, timeframe, float(signal["trailed_sl"]), move_pct)
 
             if result is None or price is None:
-                updated_signals.append(signal)
+                db.update_active_signal(db_id, data=signal)
                 continue
 
             signal["status"] = result
             signal["closed_price"] = price
 
-            # P&L расчёт
             test_trade = signal.get("test_trade") or {}
             risk_usd = float(test_trade.get("risk_usd", 0.0)) if isinstance(test_trade, dict) else 0.0
             qty = float(test_trade.get("qty", 0.0)) if isinstance(test_trade, dict) else 0.0
@@ -393,15 +337,14 @@ def track_signals(interval_seconds: int = 86400) -> None:
                 signal["test_pnl_usd"] = test_pnl_usd
                 signal["test_pnl_rr"] = test_pnl_rr
 
-            # Обновляем статистику
             total_closed += 1
             if result in ("TP", "TSL"):
                 wins += 1
             elif result == "SL":
                 losses += 1
             win_rate = (wins / total_closed * 100.0) if total_closed > 0 else 0.0
-            stats.update({"total_closed": total_closed, "wins": wins, "losses": losses, "win_rate": win_rate})
-            save_stats(STATS_PATH, stats)
+
+            db.update_active_signal(db_id, data=signal, status=result)
 
             logger.info(
                 "Сигнал закрыт: %s/%s %s → %s по цене %.4f | PnL %s",
@@ -409,7 +352,6 @@ def track_signals(interval_seconds: int = 86400) -> None:
                 f"{test_pnl_usd:+.2f}$" if test_pnl_usd is not None else "N/A",
             )
 
-            # Запись в БД
             try:
                 db.save_trade({
                     "asset": asset,
@@ -427,12 +369,11 @@ def track_signals(interval_seconds: int = 86400) -> None:
                     "opened_at": None,
                     "closed_at": datetime.utcnow(),
                     "source": "tracker",
-                    "signal_snapshot": {k: v for k, v in signal.items()},
+                    "signal_snapshot": {k: v for k, v in signal.items() if k != "_db_id"},
                 })
             except Exception as exc:
                 logger.error("Ошибка записи сделки в БД: %s", exc)
 
-            # Уведомление в Telegram
             text = build_result_message(
                 asset=asset,
                 timeframe=timeframe,
@@ -453,15 +394,9 @@ def track_signals(interval_seconds: int = 86400) -> None:
                 except Exception as exc:
                     logger.warning("Ошибка отправки результата %s/%s подписчику %d: %s", asset, timeframe, chat_id, exc)
 
-            updated_signals.append(signal)
-
-        # Оставляем только незакрытые
-        open_signals = [s for s in updated_signals if s.get("status") not in {"TP", "SL", "TSL"}]
-        save_active_signals(ACTIVE_SIGNALS_PATH, open_signals)
-
         # Дневная аналитика — отправляем всем подписчикам
         try:
-            analytics_text = build_daily_analytics_message(db, stats)
+            analytics_text = build_daily_analytics_message(db)
             for chat_id in subscribers:
                 try:
                     send_telegram_message(

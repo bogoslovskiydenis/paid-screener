@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.utils.format_price import fmt_price
 from src.utils.session import session_line, session_risk_note, get_session
+from src.storage.database import Database
+from src.utils.config import Settings
 
 load_dotenv()
 TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -27,77 +29,22 @@ if not TELEGRAM_BOT_TOKEN:
     )
 
 
-TELEGRAM_DAILY_SENDS_PATH = Path("data/telegram_daily_sends.json")
-
 MAX_SIGNAL_SENDS_PER_DAY = 6
 MIN_SIGNAL_CONFIDENCE_REPEAT = 0.7
+SIGNAL_COOLDOWN_HOURS = 2
+
+_quota_db_instance: Database | None = None
+
+
+def _quota_db() -> Database:
+    global _quota_db_instance
+    if _quota_db_instance is None:
+        _quota_db_instance = Database(Settings().database_url)
+    return _quota_db_instance
 
 
 def daily_quota_key(asset: str, timeframe: str, signal_type: str, day_iso: str) -> str:
     return f"{asset}|{timeframe}|{signal_type}|{day_iso}"
-
-
-SIGNAL_COOLDOWN_HOURS = 2
-
-
-def load_daily_sends(path: Path) -> Dict[str, Any]:
-    today = date.today().isoformat()
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        try:
-            raw = json.load(f)
-        except json.JSONDecodeError:
-            return {}
-    if not isinstance(raw, dict):
-        return {}
-    out: Dict[str, Any] = {}
-    for k, v in raw.items():
-        if not isinstance(k, str):
-            continue
-        parts = k.split("|")
-        if len(parts) < 4 or parts[-1] != today:
-            continue
-        # поддержка старого формата (int) и нового (dict)
-        if isinstance(v, int):
-            out[k] = {"count": v, "last_sent": None}
-        elif isinstance(v, dict):
-            out[k] = v
-    return out
-
-
-def save_daily_sends(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def quota_count(daily_sends: Dict[str, Any], key: str) -> int:
-    entry = daily_sends.get(key)
-    if entry is None:
-        return 0
-    if isinstance(entry, dict):
-        return int(entry.get("count", 0))
-    return int(entry)
-
-
-def quota_can_send(daily_sends: Dict[str, Any], key: str) -> bool:
-    if quota_count(daily_sends, key) >= MAX_SIGNAL_SENDS_PER_DAY:
-        return False
-    entry = daily_sends.get(key)
-    if entry and isinstance(entry, dict) and entry.get("last_sent"):
-        try:
-            last = datetime.fromisoformat(entry["last_sent"])
-            if datetime.now() - last < timedelta(hours=SIGNAL_COOLDOWN_HOURS):
-                return False
-        except (ValueError, TypeError):
-            pass
-    return True
-
-
-def quota_record(daily_sends: Dict[str, Any], key: str) -> None:
-    count = quota_count(daily_sends, key) + 1
-    daily_sends[key] = {"count": count, "last_sent": datetime.now().isoformat()}
 
 
 def load_signals(path: Path) -> Dict[str, Any]:
@@ -137,38 +84,6 @@ def _btc_blocks_alt_spot_buy(data: Dict[str, Any], anchor_tf: str = "1d", timing
     return True
 
 
-def save_active_signals(path: Path, signals: List[Dict[str, Any]]) -> None:
-    """Добавляет новые сигналы к ещё открытым, не затирая их.
-
-    Раньше файл перезаписывался целиком списком новой рассылки, и трекер
-    терял все предыдущие открытые позиции (их TP/SL переставали проверяться).
-    """
-    existing: List[Dict[str, Any]] = []
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                existing = data
-        except (json.JSONDecodeError, OSError):
-            existing = []
-
-    still_open = [s for s in existing if s.get("status") not in {"TP", "SL", "TSL"}]
-
-    def _key(s: Dict[str, Any]) -> tuple:
-        return (str(s.get("asset")), str(s.get("timeframe")), str(s.get("signal_type") or ""))
-
-    # Открытый сигнал по тому же активу/ТФ/типу сохраняем — у него уже есть
-    # состояние трекинга (best_price, trailed_sl); дубль из новой рассылки не пишем.
-    known = {_key(s) for s in still_open}
-    merged = list(still_open)
-    for s in signals:
-        if _key(s) not in known:
-            known.add(_key(s))
-            merged.append(s)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
 
 
 def collect_buy_signals(
@@ -714,7 +629,7 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
         return
 
     today = date.today().isoformat()
-    daily_sends = load_daily_sends(TELEGRAM_DAILY_SENDS_PATH)
+    qdb = _quota_db()
     floor = max(float(args.min_confidence), MIN_SIGNAL_CONFIDENCE_REPEAT)
     new_signals: List[Dict[str, Any]] = []
     for s in filtered_signals:
@@ -723,7 +638,7 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
         k = daily_quota_key(
             str(s["asset"]), str(s["timeframe"]), str(s.get("signal_type") or ""), today
         )
-        if not quota_can_send(daily_sends, k):
+        if not qdb.quota_can_send(k, MAX_SIGNAL_SENDS_PER_DAY, SIGNAL_COOLDOWN_HOURS):
             continue
         new_signals.append(s)
 
@@ -734,10 +649,6 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
             f"или порог уверенности < {floor:.0%}."
         )
         return
-
-    # сохраняем активные сигналы для последующего трекинга TP/SL
-    active_signals_path = Path("data/active_signals.json")
-    save_active_signals(active_signals_path, new_signals)
 
     message = build_message(new_signals)
 
@@ -752,13 +663,9 @@ def broadcast_signals(token: str, subscribers_path: Path, signals_file: Path, ar
     if sent > 0:
         for s in new_signals:
             k = daily_quota_key(
-                str(s["asset"]),
-                str(s["timeframe"]),
-                str(s.get("signal_type") or ""),
-                today,
+                str(s["asset"]), str(s["timeframe"]), str(s.get("signal_type") or ""), today
             )
-            quota_record(daily_sends, k)
-        save_daily_sends(TELEGRAM_DAILY_SENDS_PATH, daily_sends)
+            qdb.quota_record(k)
 
     print(f"Отправлено {len(new_signals)} сигналов {sent} подписчикам.")
 
@@ -866,11 +773,11 @@ def broadcast_accumulation_signals(
         return
 
     today = date.today().isoformat()
-    daily_sends = load_daily_sends(TELEGRAM_DAILY_SENDS_PATH)
+    qdb = _quota_db()
     new_signals: List[Dict[str, Any]] = []
     for s in filtered:
         k = daily_quota_key(str(s.get("asset", "")), "1d", "ACCUMULATION", today)
-        if quota_can_send(daily_sends, k):
+        if qdb.quota_can_send(k, MAX_SIGNAL_SENDS_PER_DAY, SIGNAL_COOLDOWN_HOURS):
             new_signals.append(s)
 
     if not new_signals:
@@ -889,8 +796,7 @@ def broadcast_accumulation_signals(
     if sent > 0:
         for s in new_signals:
             k = daily_quota_key(str(s.get("asset", "")), "1d", "ACCUMULATION", today)
-            quota_record(daily_sends, k)
-        save_daily_sends(TELEGRAM_DAILY_SENDS_PATH, daily_sends)
+            qdb.quota_record(k)
 
     print(f"Отправлено {len(new_signals)} сигналов накопления {sent} подписчикам.")
 
@@ -912,12 +818,12 @@ def broadcast_pump_signals(
         return
 
     today = date.today().isoformat()
-    daily_sends = load_daily_sends(TELEGRAM_DAILY_SENDS_PATH)
+    qdb = _quota_db()
     new_signals: List[Dict[str, Any]] = []
     for s in filtered:
         sig_type = s.get("signal_type", "PUMP")
         k = daily_quota_key(str(s.get("asset", "")), "1h", sig_type, today)
-        if quota_can_send(daily_sends, k):
+        if qdb.quota_can_send(k, MAX_SIGNAL_SENDS_PER_DAY, SIGNAL_COOLDOWN_HOURS):
             new_signals.append(s)
 
     if not new_signals:
@@ -937,8 +843,7 @@ def broadcast_pump_signals(
         for s in new_signals:
             sig_type = s.get("signal_type", "PUMP")
             k = daily_quota_key(str(s.get("asset", "")), "1h", sig_type, today)
-            quota_record(daily_sends, k)
-        save_daily_sends(TELEGRAM_DAILY_SENDS_PATH, daily_sends)
+            qdb.quota_record(k)
 
     print(f"Отправлено {len(new_signals)} памп-сигналов {sent} подписчикам.")
 
@@ -1056,8 +961,8 @@ def broadcast_spot_overview(
 
     today = date.today().isoformat()
     quota_key = f"_market_overview|{today}"
-    daily_sends = load_daily_sends(TELEGRAM_DAILY_SENDS_PATH)
-    if daily_sends.get(quota_key, 0) >= max_per_day:
+    qdb = _quota_db()
+    if qdb.quota_count(quota_key) >= max_per_day:
         print(f"Обзор рынка уже отправлен {max_per_day} раз сегодня, пропускаем.")
         return
 
@@ -1075,9 +980,9 @@ def broadcast_spot_overview(
             print(f"Ошибка отправки обзора подписчику {chat_id}: {exc}")
 
     if sent:
-        daily_sends[quota_key] = daily_sends.get(quota_key, 0) + 1
-        save_daily_sends(TELEGRAM_DAILY_SENDS_PATH, daily_sends)
-        print(f"Отправлен обзор рынка {sent} подписчикам ({daily_sends[quota_key]}/{max_per_day} сегодня).")
+        qdb.quota_record(quota_key)
+        count = qdb.quota_count(quota_key)
+        print(f"Отправлен обзор рынка {sent} подписчикам ({count}/{max_per_day} сегодня).")
 
 
 def build_liq_message(liq_result: Dict[str, Any]) -> Optional[str]:
