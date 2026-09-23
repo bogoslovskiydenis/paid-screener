@@ -22,7 +22,6 @@ assets:
   - SHIB     # Shiba Inu (мем)
   - UNI      # Uniswap
   - NEAR     # NEAR Protocol
-  - TAO      # Bittensor
   - PUMP     # Pump.fun (мем-платформа)
   - AAVE     # Aave
   - WLFI     # World Liberty Financial
@@ -32,28 +31,23 @@ assets:
   - MORPHO   # Morpho
   - DOT      # Polkadot
   - ENA      # Ethena
-  - SKY      # Sky (ex-Maker)
-  - WLD      # Worldcoin
-  - ICP      # Internet Computer
-  - ETC      # Ethereum Classic
-  - POL      # POL (ex-MATIC)
   - QNT      # Quant
   - JST      # JUST
   - ATOM     # Cosmos
   - ALGO     # Algorand
   - RENDER   # Render
   - JUP      # Jupiter
+  - JTO      # Jito
   - ARB      # Arbitrum
-  - TRUMP    # Official Trump (мем)
-  - FIL      # Filecoin
   - ETHFI    # Ether.fi
-  - CAKE     # PancakeSwap
   - APT      # Aptos
   - PENGU    # Pudgy Penguins (мем)
   - DASH     # Dash
   - CRV      # Curve
   - HEMI     # Hemi (Bitcoin L2)
   - ILV      # Illuvium (гейминг)
+  - WLD      # Worldcoin
+  - 1INCH  # 1inch
   # - HYPE   # HYPE/USDT — нет на Binance spot, включить при появлении пары
   - "LAB/USDT:USDT"  # LABtrade — на Binance только perpetual (spot нет), качаем свечи с фьючерсов
   # - XMR    # Monero — делистнут с Binance
@@ -99,8 +93,17 @@ analysis:
 updates:
   interval_seconds: 60
 
+# Чёрный список для сканов топ-альтов (pump scan + accumulation scan):
+# мемы без фундаментала и токенизированные акции. На основной вотчлист не влияет.
+scan_blacklist:
+  - MARSCOIN   # мем
+  - GENIUS     # мем
+  - CRCLB      # токенизированная акция Circle
+  - MSTRB      # токенизированная акция MicroStrategy
+
 accumulation_scan:
-  enabled: false              # включается через --pump-scan флаг
+  enabled: true               # Wyckoff-детектор накопления (или через --pump-scan флаг)
+  scan_watchlist: true        # прогонять детектор и по монетам из assets, не только по внешним альтам
   timeframe: 1d               # дневной таймфрейм — накопление видно здесь
   top_n: 50                   # больше монет чем pump scan — накопление редкое
   limit: 100                  # 100 дневных свечей = ~3 месяца

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -309,12 +310,11 @@ def track_signals(interval_seconds: int = 86400) -> None:
                         price_high = float(candle["high"])
                         price_low = float(candle["low"])
 
+                    # Трейлим по best_price ПРОШЛЫХ свечей: порядок хай/лоу внутри
+                    # текущей свечи неизвестен, подтягивать стоп её же хаем и тут же
+                    # проверять её лоу — заглядывание в будущее
                     prev_best = float(signal["best_price"])
-                    signal["best_price"] = (
-                        max(prev_best, price_high) if side == "BUY" else min(prev_best, price_low)
-                    )
-
-                    trailed_sl = calc_trailed_sl(signal, float(signal["best_price"]))
+                    trailed_sl = calc_trailed_sl(signal, prev_best)
                     signal["trailed_sl"] = trailed_sl
 
                     result, price = check_hit(
@@ -323,6 +323,10 @@ def track_signals(interval_seconds: int = 86400) -> None:
                         signal_type=signal_type,
                         tp_level=tp_level,
                         sl_level=trailed_sl,
+                    )
+
+                    signal["best_price"] = (
+                        max(prev_best, price_high) if side == "BUY" else min(prev_best, price_low)
                     )
 
                     if result == "SL":
@@ -436,6 +440,29 @@ def track_signals(interval_seconds: int = 86400) -> None:
 
         logger.info("Следующая проверка через %.1f ч.", interval_seconds / 3600)
         time.sleep(interval_seconds)
+
+
+def start_tracker_thread(interval_seconds: int = 86400) -> threading.Thread:
+    """Запускает трекер фоновым потоком внутри процесса сканера.
+
+    Раньше трекер был отдельным процессом и после перезагрузки бота его
+    забывали поднять — открытые сигналы висели незакрытыми (реальный кейс:
+    с 16 июня по 20 сентября 2026). Теперь он живёт и умирает вместе со
+    сканером. При исключении внутри цикла поток перезапускает трекер сам.
+    """
+
+    def _runner() -> None:
+        while True:
+            try:
+                track_signals(interval_seconds=interval_seconds)
+            except Exception:
+                logger.exception("Трекер упал, перезапуск через 60 сек")
+                time.sleep(60)
+
+    thread = threading.Thread(target=_runner, name="signal-tracker", daemon=True)
+    thread.start()
+    logger.info("Трекер сигналов запущен фоновым потоком (интервал %.1f ч)", interval_seconds / 3600)
+    return thread
 
 
 if __name__ == "__main__":

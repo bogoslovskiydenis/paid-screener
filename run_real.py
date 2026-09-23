@@ -53,6 +53,10 @@ def main() -> None:
                         help="Интервал между итерациями, сек (default: 300)")
     parser.add_argument("--pump-scan", action="store_true",
                         help="Сканировать топ-альты на памп (дополнительно к основному анализу)")
+    parser.add_argument("--no-tracker", action="store_true",
+                        help="Не запускать трекер TP/SL фоновым потоком (в режиме --loop)")
+    parser.add_argument("--tracker-interval", type=int, default=86400,
+                        help="Интервал проверки TP/SL трекером, сек (default: 86400 = 24 часа)")
 
     args = parser.parse_args()
 
@@ -63,6 +67,10 @@ def main() -> None:
     init_config = load_config(args.config)
     components = build_components(args, init_config)
     logger.info("Компоненты инициализированы")
+
+    if args.loop and not args.no_tracker:
+        from track_signals import start_tracker_thread
+        start_tracker_thread(interval_seconds=args.tracker_interval)
 
     while True:
         try:

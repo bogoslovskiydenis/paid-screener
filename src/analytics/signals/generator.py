@@ -211,6 +211,22 @@ class SignalGenerator:
         "1M":  0.40,
     }
 
+    # Максимальное расстояние до TP1 («план закрытия») от входа.
+    # По TP1 работают трекер и спот-план, поэтому цель должна реально
+    # достигаться, а не рисовать красивый R/R (кейс AAVE 1d 2026-09-23:
+    # TP1 +13.5% не взят, +5% закрылся бы — берём с запасом меньше).
+    # Дальние уровни остаются в списке как TP2+.
+    _MAX_EXIT_PCT: Dict[str, float] = {
+        "5m":  0.005,
+        "15m": 0.008,
+        "1h":  0.015,
+        "4h":  0.025,
+        "1d":  0.04,
+        "3d":  0.06,
+        "1w":  0.08,
+        "1M":  0.10,
+    }
+
     def _evaluate_signals(
         self,
         df: pd.DataFrame,
@@ -423,6 +439,7 @@ class SignalGenerator:
         sell_score = min(sell_score, 0.97)
 
         max_tp_pct = self._MAX_TP_PCT.get(timeframe, 0.20)
+        max_exit_pct = self._MAX_EXIT_PCT.get(timeframe, 0.04)
         rsi_val = float(rsi_analysis.get("rsi") or 50)
 
         if buy_score > sell_score and buy_score > 0.6:
@@ -468,24 +485,52 @@ class SignalGenerator:
                     f"⚠️ Цена на {(1 - current_price / ema50_val) * 100:.0f}% ниже EMA50 — "
                     "очень глубокий нисходящий тренд, уверенность снижена"
                 )
+            # Штраф за противоречия: аддитивный score не видит, что против
+            # сигнала тоже набрались очки (кейс BTC 1d 2026-09-19: BUY 0.97
+            # при медвежьей дивергенции MACD, медвежьей структуре и RSI 64
+            # у хая диапазона). STRONG требует чистого контекста.
+            contradictions = []
+            if macd_div == "BEARISH":
+                contradictions.append("медвежья дивергенция MACD")
+            if ms.get("structure") == "BEARISH":
+                contradictions.append("структура BEARISH")
+            if rsi_val >= 62:
+                # порог согласован с pullback-режимом: «остывший» RSI ≤ 62
+                contradictions.append(f"RSI {rsi_val:.0f} не остыл")
+            buy_score = self._apply_contradiction_cap(
+                buy_score, contradictions, buy_factors
+            )
             return self._create_buy_signal(
                 df, current_price, buy_score, buy_factors,
                 levels, head_shoulders, volume_confirmation, rsi_analysis,
                 atr_value=atr_value, ema_analysis=ema_analysis, macd_analysis=macd_analysis,
-                max_tp_pct=max_tp_pct,
+                max_tp_pct=max_tp_pct, max_exit_pct=max_exit_pct,
                 vwap_data=vwap_data, volume_profile=volume_profile,
                 fibonacci=fibonacci, order_blocks=obs,
             )
         elif sell_score > buy_score and sell_score > 0.6:
             if rsi_val < 55:
                 return None
+            # Симметричный штраф для SELL: шорт против бычьего тренда/структуры
+            # не может быть STRONG (кейс ETH 1d 2026-09-19: SELL при EMA BULLISH
+            # и структуре BULLISH).
+            contradictions = []
+            if macd_div == "BULLISH":
+                contradictions.append("бычья дивергенция MACD")
+            if ms.get("structure") == "BULLISH":
+                contradictions.append("структура BULLISH")
+            if ema_trend == "BULLISH":
+                contradictions.append("SELL против бычьего тренда EMA")
+            sell_score = self._apply_contradiction_cap(
+                sell_score, contradictions, sell_factors
+            )
             return self._create_sell_signal(
                 df, current_price, sell_score, sell_factors,
                 levels, head_shoulders, volume_confirmation, rsi_analysis,
                 atr_value=atr_value, ema_analysis=ema_analysis, macd_analysis=macd_analysis,
-                max_tp_pct=max_tp_pct,
+                max_tp_pct=max_tp_pct, max_exit_pct=max_exit_pct,
             )
-        
+
         return None
     
     def _filter_tp_by_rr(
@@ -515,6 +560,153 @@ class SignalGenerator:
             if reward > 0 and reward / risk >= min_rr:
                 kept.append(tp)
         return kept
+
+    def _cap_primary_exit(
+        self,
+        entry_price: float,
+        filtered_tp: List[Dict[str, Any]],
+        all_tp: List[Dict[str, Any]],
+        exit_pct: float,
+        direction: str,
+    ) -> List[Dict[str, Any]]:
+        """Прижимает TP1 к входу, если ближайшая цель дальше exit_pct.
+
+        Приоритет — закрытая сделка, а не R/R: за TP1 нужно почти 100%
+        исполнение. Если TP1 дальше лимита, берём самый дальний реальный
+        уровень в пределах exit_pct (включая срезанные RR-фильтром),
+        без уровней — синтетическую цель на границе лимита.
+        Дальние цели остаются в списке как TP2+.
+        """
+        if direction == "BUY":
+            limit = entry_price * (1 + exit_pct)
+        else:
+            limit = entry_price * (1 - exit_pct)
+
+        first = next(
+            (tp["level"] for tp in filtered_tp
+             if isinstance(tp.get("level"), (int, float))),
+            None,
+        )
+        if first is not None and (
+            first <= limit if direction == "BUY" else first >= limit
+        ):
+            return filtered_tp
+
+        candidates = [
+            float(tp["level"]) for tp in all_tp
+            if isinstance(tp.get("level"), (int, float))
+        ]
+        if direction == "BUY":
+            near = [p for p in candidates if entry_price < p <= limit]
+            exit_level = max(near) if near else limit
+        else:
+            near = [p for p in candidates if limit <= p < entry_price]
+            exit_level = min(near) if near else limit
+
+        logger.info(
+            "TP1 прижат к входу: %.4f → %.4f (лимит %.1f%%)",
+            first if first is not None else float("nan"),
+            exit_level, exit_pct * 100,
+        )
+        return [{"level": float(exit_level), "probability": 0.75}] + filtered_tp
+
+    def _collect_tp_levels(
+        self,
+        levels: Dict[str, List[Dict[str, Any]]],
+        current_price: float,
+        tp_limit: float,
+        direction: str,
+        max_levels: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Собирает цели из ВСЕХ уровней на нужной стороне от цены.
+
+        Два исправленных дефекта:
+        1. Role reversal: старые лои выше цены («поддержки») и старые хаи ниже
+           («сопротивления») — такие же преграды, поэтому оба списка объединяются.
+           Иначе после сильного движения валидных целей не остаётся вовсе
+           (кейс NEAR 3d: все 8 ближайших «сопротивлений» ниже цены → фейковый TP +5%).
+        2. Probability по рангу близости среди ВАЛИДНЫХ целей, а не по сырому
+           индексу списка уровней — уровни по другую сторону цены больше не
+           занижают вероятность ближайшей цели (кейс LTC 3d: p=0.10 у TP1).
+        """
+        pool = levels.get("support_levels", []) + levels.get("resistance_levels", [])
+        candidates = [
+            float(lv["price"]) for lv in pool
+            if isinstance(lv.get("price"), (int, float))
+        ]
+        if direction == "BUY":
+            valid = sorted(p for p in candidates if current_price < p <= tp_limit)
+        else:
+            valid = sorted(
+                (p for p in candidates if tp_limit <= p < current_price),
+                reverse=True,
+            )
+
+        out: List[Dict[str, Any]] = []
+        for price in valid:
+            # дубль: кластер лоёв и кластер хаёв на одной цене (±0.5%)
+            if any(abs(price - tp["level"]) / price < 0.005 for tp in out):
+                continue
+            out.append({"level": price, "probability": max(0.1, 0.7 - len(out) * 0.2)})
+            if len(out) >= max_levels:
+                break
+        return out
+
+    @staticmethod
+    def _apply_contradiction_cap(
+        score: float,
+        contradictions: List[str],
+        factors: List[str],
+    ) -> float:
+        """Капает score по числу факторов, противоречащих направлению сигнала.
+
+        1 противоречие → потолок 0.84 (не STRONG), 2 и более → 0.75.
+        Бэктест 2026-07-02: confidence score-режима не коррелирует с исходом,
+        поэтому STRONG оставляем только сетапам без встречных сигналов.
+        """
+        if not contradictions:
+            return score
+        cap = 0.84 if len(contradictions) == 1 else 0.75
+        if score > cap:
+            logger.info(
+                "Confidence срезан %.2f → %.2f: противоречия — %s",
+                score, cap, ", ".join(contradictions),
+            )
+            factors.append(
+                "⚠️ Противоречия: " + ", ".join(contradictions)
+                + " — уверенность снижена"
+            )
+            return cap
+        return score
+
+    def _cap_stretched_tp_confidence(
+        self,
+        confidence: float,
+        pre_rr_tp: List[Dict[str, Any]],
+        filtered_tp: List[Dict[str, Any]],
+    ) -> float:
+        """Капает confidence, когда R/R получен растяжкой цели, а не качеством сетапа.
+
+        RR-фильтр молча выбрасывает ближние (реалистичные) цели. Если уровни
+        были, но после фильтра остались только дальние с probability <= 0.3 —
+        или не осталось ни одного и TP будет синтетическим — до цели ещё нужно
+        пробить все срезанные уровни, и STRONG такой сигнал получать не должен.
+        """
+        if not pre_rr_tp:
+            return confidence  # целей и не было (напр. цена у ATH) — не штрафуем
+        best_prob = max(
+            (tp["probability"] for tp in filtered_tp
+             if isinstance(tp.get("probability"), (int, float))),
+            default=0.0,
+        )
+        if best_prob <= 0.3 and confidence > 0.84:
+            logger.info(
+                "Confidence срезан %.2f → 0.84: RR-фильтр оставил только "
+                "маловероятные цели (best p=%.2f)",
+                confidence, best_prob,
+            )
+            return 0.84  # ниже порога STRONG (0.85)
+        return confidence
 
     def _is_risk_reward_acceptable(
         self,
@@ -563,6 +755,7 @@ class SignalGenerator:
         ema_analysis: Optional[Dict[str, Any]] = None,
         macd_analysis: Optional[Dict[str, Any]] = None,
         max_tp_pct: float = 0.20,
+        max_exit_pct: float = 0.04,
         vwap_data: Optional[Dict[str, Any]] = None,
         volume_profile: Optional[Dict[str, Any]] = None,
         fibonacci: Optional[Dict[str, Any]] = None,
@@ -585,24 +778,22 @@ class SignalGenerator:
                 stop_loss = min(nearest_support["price"] * 0.995, atr_stop)
 
         tp_max = current_price * (1 + max_tp_pct)
-        take_profit = []
-        if resistance_levels:
-            for i, res in enumerate(sorted(resistance_levels, key=lambda x: x["price"])[:8]):
-                if current_price < res["price"] <= tp_max:
-                    take_profit.append({
-                        "level": res["price"],
-                        "probability": max(0.1, 0.7 - i * 0.2)
-                    })
-        
+        take_profit = self._collect_tp_levels(levels, current_price, tp_max, "BUY")
+
         if head_shoulders and head_shoulders.get("target_price"):
             target = head_shoulders["target_price"]
             if current_price < target <= tp_max:
                 take_profit.append({"level": target, "probability": 0.6})
 
+        # Ближайшая цель всегда первая: TP1 идёт в R/R, test_trade и трекер
+        take_profit.sort(key=lambda x: x["level"])
+
         filtered_tp = [tp for tp in take_profit if isinstance(tp.get("level"), (int, float)) and tp["level"] > current_price]
 
         # Отбрасываем слишком близкие цели (R/R < 1) — иначе TP1 даёт убыточное соотношение
+        pre_rr_tp = filtered_tp
         filtered_tp = self._filter_tp_by_rr(entry_price, stop_loss, filtered_tp, "BUY", min_rr=1.0)
+        confidence = self._cap_stretched_tp_confidence(confidence, pre_rr_tp, filtered_tp)
 
         if not filtered_tp:
             filtered_tp = [{"level": min(current_price * 1.05, tp_max), "probability": 0.7}]
@@ -614,6 +805,11 @@ class SignalGenerator:
             signal_type="BUY",
         ):
             return None
+
+        # TP1 держим близко к входу: по нему работают «план закрытия» и трекер
+        filtered_tp = self._cap_primary_exit(
+            entry_price, filtered_tp, pre_rr_tp, max_exit_pct, "BUY",
+        )
 
         strength = "STRONG" if confidence >= 0.85 else "MEDIUM" if confidence >= 0.7 else "WEAK"
 
@@ -705,6 +901,7 @@ class SignalGenerator:
         ema_analysis: Optional[Dict[str, Any]] = None,
         macd_analysis: Optional[Dict[str, Any]] = None,
         max_tp_pct: float = 0.20,
+        max_exit_pct: float = 0.04,
     ) -> Optional[Dict[str, Any]]:
         """Создает сигнал на продажу."""
         support_levels = levels.get("support_levels", [])
@@ -722,24 +919,22 @@ class SignalGenerator:
                 stop_loss = max(nearest_resistance["price"] * 1.005, atr_stop)
 
         tp_min = current_price * (1 - max_tp_pct)
-        take_profit = []
-        if support_levels:
-            for i, sup in enumerate(sorted(support_levels, key=lambda x: x["price"], reverse=True)[:8]):
-                if tp_min <= sup["price"] < current_price:
-                    take_profit.append({
-                        "level": sup["price"],
-                        "probability": max(0.1, 0.7 - i * 0.2)
-                    })
-        
+        take_profit = self._collect_tp_levels(levels, current_price, tp_min, "SELL")
+
         if head_shoulders and head_shoulders.get("target_price"):
             target = head_shoulders["target_price"]
             if tp_min <= target < current_price:
                 take_profit.append({"level": target, "probability": 0.6})
 
+        # Ближайшая цель всегда первая: TP1 идёт в R/R, test_trade и трекер
+        take_profit.sort(key=lambda x: x["level"], reverse=True)
+
         filtered_tp = [tp for tp in take_profit if isinstance(tp.get("level"), (int, float)) and tp["level"] < current_price]
 
         # Отбрасываем слишком близкие цели (R/R < 1) — иначе TP1 даёт убыточное соотношение
+        pre_rr_tp = filtered_tp
         filtered_tp = self._filter_tp_by_rr(entry_price, stop_loss, filtered_tp, "SELL", min_rr=1.0)
+        confidence = self._cap_stretched_tp_confidence(confidence, pre_rr_tp, filtered_tp)
 
         if not filtered_tp:
             filtered_tp = [{"level": max(current_price * 0.95, tp_min), "probability": 0.7}]
@@ -751,6 +946,11 @@ class SignalGenerator:
             signal_type="SELL",
         ):
             return None
+
+        # TP1 держим близко к входу: по нему работают «план закрытия» и трекер
+        filtered_tp = self._cap_primary_exit(
+            entry_price, filtered_tp, pre_rr_tp, max_exit_pct, "SELL",
+        )
 
         strength = "STRONG" if confidence >= 0.85 else "MEDIUM" if confidence >= 0.7 else "WEAK"
 
@@ -1142,21 +1342,13 @@ class SignalGenerator:
             default=None,
         )
 
+        # Уровневые цели: все уровни выше цены (включая старые лои — role reversal),
+        # ближайшая — приоритетный TP1, остальные с убывающей вероятностью
         take_profit: List[Dict[str, Any]] = []
-
-        # TP1 — ближайшее сопротивление (явный приоритет над ATR-таргетами)
-        if nr_above and current_price < nr_above["price"] <= tp_max:
-            take_profit.append({"level": nr_above["price"], "probability": 0.55})
-
-        # Остальные уровни сопротивления (пропускаем уже добавленный nr_above)
-        for i, res in enumerate(sorted(resistance_levels, key=lambda x: x["price"])[:6]):
-            if not (current_price < res["price"] <= tp_max):
-                continue
-            if nr_above and abs(res["price"] - nr_above["price"]) / nr_above["price"] < 0.005:
-                continue  # дубль nr_above
+        for rank, tp in enumerate(self._collect_tp_levels(levels, current_price, tp_max, "BUY", max_levels=6)):
             take_profit.append({
-                "level": res["price"],
-                "probability": max(0.1, 0.45 - i * 0.10),
+                "level": tp["level"],
+                "probability": 0.55 if rank == 0 else max(0.1, 0.45 - (rank - 1) * 0.10),
             })
 
         # ATR-таргеты — добавляем только если не дублируют уровень сопротивления (±3%)
@@ -1178,7 +1370,9 @@ class SignalGenerator:
 
         filtered_tp = [tp for tp in take_profit if tp.get("level", 0) > current_price]
         # Отбрасываем слишком близкие цели (R/R < 1) — TP1 не должен быть убыточным
+        pre_rr_tp = filtered_tp
         filtered_tp = self._filter_tp_by_rr(entry_price, stop_loss, filtered_tp, "BUY", min_rr=1.0)
+        confidence = self._cap_stretched_tp_confidence(confidence, pre_rr_tp, filtered_tp)
         if not filtered_tp:
             filtered_tp = [{"level": min(current_price * 1.05, tp_max), "probability": 0.5}]
 
@@ -1198,6 +1392,12 @@ class SignalGenerator:
                 rr, entry_price, stop_loss, best_tp or 0,
             )
             return None
+
+        # TP1 держим близко к входу: по нему работают «план закрытия» и трекер
+        filtered_tp = self._cap_primary_exit(
+            entry_price, filtered_tp, pre_rr_tp,
+            self._MAX_EXIT_PCT.get(timeframe, 0.04), "BUY",
+        )
 
         strength = "STRONG" if confidence >= 0.85 else "MEDIUM" if confidence >= 0.70 else "WEAK"
 
@@ -1375,6 +1575,7 @@ class SignalGenerator:
             rsi_analysis=rsi_analysis, atr_value=atr_value,
             ema_analysis=ema_analysis, macd_analysis=macd_analysis,
             max_tp_pct=self._MAX_TP_PCT.get(timeframe, 0.20),
+            max_exit_pct=self._MAX_EXIT_PCT.get(timeframe, 0.04),
             vwap_data=(vwap_data or self.vwap_calculator.analyze(df)),
             volume_profile=volume_profile, fibonacci=fibonacci, order_blocks=obs,
         )
@@ -1498,6 +1699,7 @@ class SignalGenerator:
             rsi_analysis=rsi_analysis, atr_value=atr_value,
             ema_analysis=ema_analysis, macd_analysis=macd_analysis,
             max_tp_pct=self._MAX_TP_PCT.get(timeframe, 0.20),
+            max_exit_pct=self._MAX_EXIT_PCT.get(timeframe, 0.04),
             vwap_data=(vwap_data or self.vwap_calculator.analyze(df)),
             volume_profile=volume_profile, fibonacci=fibonacci, order_blocks=obs,
         )

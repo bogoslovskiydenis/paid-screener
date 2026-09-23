@@ -48,11 +48,12 @@ def run_pump_scan(args, config: dict, c: Components) -> list:
         "Pump scan: топ-%d альтов | мин объём $%s | мин mcap $%s",
         top_n, f"{min_vol:,.0f}", f"{min_mcap:,.0f}",
     )
+    blacklist = {str(b).upper() for b in config.get("scan_blacklist", [])}
     alts = c.exchange_manager.get_top_alts(
         top_n=top_n,
         min_volume_usd=min_vol,
         min_market_cap_usd=min_mcap,
-        exclude=main_assets,
+        exclude=main_assets | blacklist,
     )
     logger.info("Pump scan: найдено %d альтов для анализа", len(alts))
 

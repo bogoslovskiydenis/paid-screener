@@ -52,3 +52,4 @@ Thumbs.db
 signals*.json
 test_real.json
 
+.venv/

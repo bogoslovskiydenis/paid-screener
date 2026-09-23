@@ -34,18 +34,26 @@ def run_accumulation_scan(args, config: dict, c: Components) -> list:
         if "/" not in a
     )
 
+    blacklist = {str(b).upper() for b in config.get("scan_blacklist", [])}
+
     logger.info("=" * 60)
     logger.info("Accumulation scan: топ-%d альтов на %s", top_n, timeframe)
     alts = c.exchange_manager.get_top_alts(
         top_n=top_n,
         min_volume_usd=min_vol,
         min_market_cap_usd=min_mcap,
-        exclude=main_assets,
+        exclude=main_assets | blacklist,
     )
     logger.info("Accumulation scan: %d альтов для анализа", len(alts))
 
+    targets = list(alts)
+    if bool(acc_cfg.get("scan_watchlist", True)):
+        watchlist = [a for a in sorted(main_assets) if a not in set(alts)]
+        targets += watchlist
+        logger.info("Accumulation scan: + %d монет из вотчлиста", len(watchlist))
+
     acc_signals = []
-    for alt in alts:
+    for alt in targets:
         try:
             df = c.exchange_manager.get_ohlcv(alt, timeframe, limit=limit)
             if df.empty or len(df) < 50:
@@ -58,8 +66,8 @@ def run_accumulation_scan(args, config: dict, c: Components) -> list:
 
     acc_signals.sort(key=lambda x: x["confidence"], reverse=True)
     logger.info(
-        "Accumulation scan завершён: %d сигналов из %d альтов",
-        len(acc_signals), len(alts),
+        "Accumulation scan завершён: %d сигналов из %d монет",
+        len(acc_signals), len(targets),
     )
     for sig in acc_signals:
         logger.info(

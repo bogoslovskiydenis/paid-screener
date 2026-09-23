@@ -1,4 +1,6 @@
 """Модуль для работы с базой данных."""
+import json
+
 from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean, JSON, Text, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -8,6 +10,28 @@ import pandas as pd
 from ..utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+
+def _json_safe(obj):
+    """Приводит значение к JSON-сериализуемому виду.
+
+    В сигналах встречаются datetime (timestamp генератора) и numpy-скаляры
+    (np.float64 из pandas) — stdlib json.dumps на них падает.
+    """
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if hasattr(obj, "item") and callable(obj.item):  # numpy-скаляры
+        try:
+            return obj.item()
+        except Exception:
+            return str(obj)
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    return str(obj)
 
 Base = declarative_base()
 
@@ -148,7 +172,12 @@ class Database:
     """Класс для работы с базой данных."""
 
     def __init__(self, database_url: str):
-        self.engine = create_engine(database_url, echo=False)
+        self.engine = create_engine(
+            database_url,
+            echo=False,
+            # страховка для JSON-колонок: datetime/np-типы не роняют INSERT
+            json_serializer=lambda obj: json.dumps(_json_safe(obj), ensure_ascii=False),
+        )
         if database_url.startswith("sqlite"):
             @event.listens_for(self.engine, "connect")
             def _set_wal(dbapi_conn, _record):
@@ -528,7 +557,7 @@ class Database:
                 signal_type=stype,
                 status=None,
                 added_at=now,
-                data=dict(signal),
+                data=_json_safe(signal),
             )
             session.add(row)
             session.commit()
@@ -600,7 +629,7 @@ class Database:
         try:
             row = session.query(ActiveSignal).filter(ActiveSignal.id == db_id).first()
             if row:
-                row.data = {k: v for k, v in data.items() if k != "_db_id"}
+                row.data = _json_safe({k: v for k, v in data.items() if k != "_db_id"})
                 if status is not None:
                     row.status = status
                 session.commit()
