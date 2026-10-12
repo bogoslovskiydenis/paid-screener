@@ -329,7 +329,7 @@ def main() -> None:
                         help="Порог генератора (0.6 — чтобы увидеть и зону ниже live-порога 0.7)")
     parser.add_argument("--tp-sweep", type=str, default="",
                         help="Свип дистанции TP в R, напр. '0.7,1.0,1.5,2.0'")
-    parser.add_argument("--fee-pct", type=float, default=0.0, help="Комиссия на сторону, % (Binance spot = 0.1)")
+    parser.add_argument("--fee-pct", type=float, default=0.0, help="Комиссия на сторону в процентах (Binance spot = 0.1)")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--output", type=str, default=str(RESULTS_PATH))
     args = parser.parse_args()

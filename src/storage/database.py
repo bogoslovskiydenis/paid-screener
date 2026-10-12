@@ -424,16 +424,22 @@ class Database:
         finally:
             session.close()
 
-    def get_trade_analytics(self) -> Dict[str, Any]:
-        """Агрегированная аналитика по закрытым сделкам из таблицы trades."""
+    def get_trade_analytics(self, since: Optional[datetime] = None) -> Dict[str, Any]:
+        """Агрегированная аналитика по закрытым сделкам из таблицы trades.
+
+        since — учитывать только сделки, закрытые не раньше этого момента (UTC).
+        """
         session = self.get_session()
         try:
-            trades = session.query(Trade).all()
+            q = session.query(Trade)
+            if since is not None:
+                q = q.filter(Trade.closed_at >= since)
+            trades = q.all()
             if not trades:
                 return {"total": 0}
 
             total = len(trades)
-            wins = sum(1 for t in trades if t.result in ("TP", "TSL"))
+            wins = sum(1 for t in trades if t.result in ("TP", "TSL", "MOM"))
             losses = sum(1 for t in trades if t.result == "SL")
             win_rate = wins / total * 100 if total else 0.0
 
@@ -447,7 +453,7 @@ class Database:
                     groups.setdefault(k, []).append(t)
                 out = {}
                 for k, ts in sorted(groups.items()):
-                    w = sum(1 for t in ts if t.result in ("TP", "TSL"))
+                    w = sum(1 for t in ts if t.result in ("TP", "TSL", "MOM"))
                     out[k] = {
                         "total": len(ts),
                         "wins": w,
@@ -476,6 +482,9 @@ class Database:
                 "avg_rr_on_wins": round(
                     sum(r for r in rr_values if r and r > 0) / max(1, sum(1 for r in rr_values if r and r > 0)), 2
                 ) if rr_values else None,
+                # Матожидание на сделку: среднее R по ВСЕМ сделкам, включая стопы.
+                # Положительное — система зарабатывает, даже если win rate < 50%.
+                "avg_rr_all": round(sum(rr_values) / len(rr_values), 2) if rr_values else None,
                 "by_asset": _group_stats(lambda t: t.asset),
                 "by_timeframe": _group_stats(lambda t: t.timeframe),
                 "by_strength": _group_stats(lambda t: t.strength or "?"),

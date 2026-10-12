@@ -288,6 +288,14 @@ def execute_signal(
         logger.info("[executor] Кросс-пара %s пропущена (только USDT)", asset)
         return None
 
+    # Бюджет риска портфеля: флаг ставится при добавлении сигнала в трекер
+    if signal.get("in_budget") is False:
+        logger.info(
+            "[executor] %s/%s: вне бюджета риска (%s) — только уведомление",
+            asset, timeframe, signal.get("budget_reason"),
+        )
+        return None
+
     allowed_tfs = _trade_timeframes()
     if allowed_tfs is not None and timeframe not in allowed_tfs:
         logger.info(

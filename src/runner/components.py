@@ -49,7 +49,10 @@ def build_components(args: argparse.Namespace, config: dict) -> Components:
     return Components(
         exchange_manager=ExchangeManager(enabled_exchanges),
         database=Database(settings.database_url),
-        signal_generator=SignalGenerator(min_confidence=args.min_confidence),
+        signal_generator=SignalGenerator(
+            min_confidence=args.min_confidence,
+            test_risk_usd=acfg.test_risk_usd,
+        ),
         levels_analyzer=SupportResistanceAnalyzer(
             min_touches=acfg.min_touches,
             price_tolerance=acfg.price_tolerance,

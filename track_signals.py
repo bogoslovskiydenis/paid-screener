@@ -76,12 +76,24 @@ def _parse_added_at(signal: Dict[str, Any]) -> datetime:
 # Логика трекинга
 # ---------------------------------------------------------------------------
 
-def get_tp_level(signal: Dict[str, Any]) -> Optional[float]:
-    """Возвращает первый TP-уровень из сигнала."""
+# Доля позиции, закрываемая на TP1. Остаток едет на трейлинге
+# со стопом не ниже безубытка — чтобы не отдавать весь ход за +0.3R.
+PARTIAL_EXIT_FRACTION = 0.5
+
+
+def get_tp_levels(signal: Dict[str, Any]) -> List[float]:
+    """Все TP-уровни сигнала по порядку (TP1 — ближайший)."""
+    out: List[float] = []
     for tp in (signal.get("take_profit") or []):
         if isinstance(tp, dict) and isinstance(tp.get("level"), (int, float)):
-            return float(tp["level"])
-    return None
+            out.append(float(tp["level"]))
+    return out
+
+
+def get_tp_level(signal: Dict[str, Any]) -> Optional[float]:
+    """Возвращает первый TP-уровень из сигнала."""
+    levels = get_tp_levels(signal)
+    return levels[0] if levels else None
 
 
 def get_trail_distance(signal: Dict[str, Any]) -> float:
@@ -93,34 +105,65 @@ def get_trail_distance(signal: Dict[str, Any]) -> float:
 
 
 def calc_trailed_sl(signal: Dict[str, Any], best_price: float) -> float:
-    """Trailing SL — активируется после прохождения 1R в сторону прибыли."""
+    """Trailing SL — активируется после прохождения 1R в сторону прибыли.
+
+    После частичного закрытия на TP1 трейлинг включается сразу (1R ждать
+    не нужно: цель уже взята), а стоп остатка не опускается ниже безубытка.
+    """
     side = str(signal.get("signal_type") or "").upper()
     entry = float(signal["entry_price"])
     original_sl = float(signal["stop_loss"])
     dist = get_trail_distance(signal)
     risk = abs(entry - original_sl)
+    tp1_filled = bool(signal.get("tp1_filled"))
 
     if side == "BUY":
+        if tp1_filled:
+            return max(original_sl, entry, best_price - dist)
         if best_price < entry + risk:
             return original_sl
         return max(original_sl, best_price - dist)
     else:
+        if tp1_filled:
+            return min(original_sl, entry, best_price + dist)
         if best_price > entry - risk:
             return original_sl
         return min(original_sl, best_price + dist)
+
+
+def momentum_still_bullish(side: str, idx: int, closes, ema9, ema21) -> bool:
+    """Жив ли тренд на момент касания цели — решает, двигать ли TP выше.
+
+    Смотрим ПРОШЛУЮ свечу (idx-1): внутри текущей порядок хай/лоу неизвестен,
+    решение по её закрытию — заглядывание в будущее. Мало истории (<22 свечей
+    до касания) → False, закрываемся по цели как раньше.
+    """
+    j = idx - 1
+    if j < 21:
+        return False
+    if side == "BUY":
+        return float(ema9.iloc[j]) > float(ema21.iloc[j]) and float(closes.iloc[j]) > float(ema21.iloc[j])
+    return float(ema9.iloc[j]) < float(ema21.iloc[j]) and float(closes.iloc[j]) < float(ema21.iloc[j])
 
 
 def check_hit(
     price_high: float,
     price_low: float,
     signal_type: str,
-    tp_level: float,
+    tp_level: Optional[float],
     sl_level: float,
 ) -> Tuple[Optional[str], Optional[float]]:
-    """Проверяет, задеты ли TP или SL. SL имеет приоритет."""
+    """Проверяет, задеты ли TP или SL. SL имеет приоритет.
+
+    tp_level=None — цели нет (остаток позиции после TP1 без TP2),
+    закрытие возможно только по стопу.
+    """
     side = (signal_type or "").upper()
     hit_sl = price_low <= sl_level if side == "BUY" else price_high >= sl_level
-    hit_tp = price_high >= tp_level if side == "BUY" else price_low <= tp_level
+    hit_tp = (
+        False if tp_level is None
+        else (price_high >= tp_level if side == "BUY" else price_low <= tp_level)
+    )
 
     if hit_sl:
         return "SL", sl_level
@@ -129,45 +172,74 @@ def check_hit(
     return None, None
 
 
-def build_daily_analytics_message(db: Database) -> str:
-    """Формирует суточный отчёт по сигналам для Telegram."""
-    analytics = db.get_trade_analytics()
+def _period_stats_line(label: str, analytics: Dict[str, Any]) -> str:
+    """Одна строка сводки за период: сделки, W/L, win rate, P&L."""
     total = analytics.get("total", 0)
-    if total == 0:
-        return "📊 Дневная аналитика: закрытых сделок пока нет."
-
-    wins = analytics["wins"]
-    losses = analytics["losses"]
-    wr = analytics["win_rate"]
+    if not total:
+        return f"{label}: сделок нет"
+    line = (
+        f"{label}: <b>{total}</b> | {analytics['wins']}W/{analytics['losses']}L"
+        f" | WR <b>{analytics['win_rate']:.1f}%</b>"
+    )
     pnl = analytics.get("total_pnl_usd")
-    avg_rr = analytics.get("avg_rr_on_wins")
-
-    lines = [
-        "📊 <b>Дневная аналитика сигналов</b>",
-        f"Всего закрыто: <b>{total}</b> | Победы: {wins} | Потери: {losses}",
-        f"Win Rate: <b>{wr:.1f}%</b>",
-    ]
     if pnl is not None:
         sign = "+" if pnl >= 0 else ""
-        lines.append(f"Итого P&amp;L: <b>{sign}{pnl:.2f}$</b> (тест $10 риск/сделку)")
+        line += f" | P&amp;L <b>{sign}{pnl:.2f}$</b>"
+    return line
+
+
+def build_daily_analytics_message(db: Database) -> str:
+    """Отчёт по сигналам для Telegram: сегодня / 7 дней / всё время (UTC)."""
+    now = datetime.utcnow()
+    day = db.get_trade_analytics(since=now.replace(hour=0, minute=0, second=0, microsecond=0))
+    week = db.get_trade_analytics(since=now - timedelta(days=7))
+    all_time = db.get_trade_analytics()
+
+    if not all_time.get("total"):
+        return "📊 Аналитика сигналов: закрытых сделок пока нет."
+
+    from src.utils.config import get_analysis_config
+    risk_usd = get_analysis_config(load_config(CONFIG_PATH)).test_risk_usd
+    lines = [
+        f"📊 <b>Аналитика сигналов</b> (тест ${risk_usd:g} риск/сделку)",
+        _period_stats_line("Сегодня", day),
+        _period_stats_line("7 дней", week),
+        _period_stats_line("Всё время", all_time),
+    ]
+    avg_rr = week.get("avg_rr_on_wins")
     if avg_rr is not None:
-        lines.append(f"Средний R/R на победах: <b>{avg_rr:.2f}R</b>")
+        lines.append(f"Средний R на победах за 7 дней: <b>{avg_rr:.2f}R</b>")
+    # Матожидание — главная метрика: >0 система зарабатывает, <0 сливает
+    exp_week = week.get("avg_rr_all")
+    exp_all = all_time.get("avg_rr_all")
+    if exp_week is not None or exp_all is not None:
+        parts = []
+        if exp_week is not None:
+            parts.append(f"7 дней: <b>{exp_week:+.2f}R</b>")
+        if exp_all is not None:
+            parts.append(f"всё время: <b>{exp_all:+.2f}R</b>")
+        lines.append("Матожидание на сделку — " + " | ".join(parts))
 
-    by_asset = analytics.get("by_asset", {})
+    # Разбивки по активам/ТФ — за неделю: срез за всю историю не показывает,
+    # что работает сейчас. Если за неделю пусто — за всю историю.
+    detail = week if week.get("total") else all_time
+    detail_label = "7 дней" if week.get("total") else "всё время"
+
+    by_asset = detail.get("by_asset", {})
     if by_asset:
-        lines.append("\n<b>По активам:</b>")
+        lines.append(f"\n<b>По активам ({detail_label}):</b>")
         for asset, s in sorted(by_asset.items(), key=lambda x: -x[1]["win_rate"]):
-            lines.append(f"  {asset}: {s['win_rate']:.0f}%  {s['wins']}W/{s['losses']}L")
+            lines.append(
+                f"  {asset}: {s['win_rate']:.0f}%  {s['wins']}W/{s['losses']}L  {s['pnl_usd']:+.1f}$"
+            )
 
-    by_tf = analytics.get("by_timeframe", {})
+    by_tf = detail.get("by_timeframe", {})
     if by_tf:
-        lines.append("\n<b>По таймфреймам:</b>")
+        lines.append(f"\n<b>По таймфреймам ({detail_label}):</b>")
         for tf, s in sorted(by_tf.items()):
-            lines.append(f"  {tf}: {s['win_rate']:.0f}%  {s['wins']}W/{s['losses']}L")
-
-    day_closed = db.today_closed_count()
-    if day_closed:
-        lines.append(f"\nЗа сегодня закрыто: <b>{day_closed}</b> сделок")
+            lines.append(
+                f"  {tf}: {s['win_rate']:.0f}%  {s['wins']}W/{s['losses']}L  {s['pnl_usd']:+.1f}$"
+            )
 
     return "\n".join(lines)
 
@@ -185,16 +257,32 @@ def build_result_message(
     win_rate: Optional[float] = None,
     total_closed: Optional[int] = None,
     wins: Optional[int] = None,
+    tp1_price: Optional[float] = None,
+    tp1_pnl_usd: Optional[float] = None,
+    tp_extensions: int = 0,
 ) -> str:
     strength_map = {"STRONG": "СИЛЬНЫЙ", "MEDIUM": "СРЕДНИЙ"}
     strength_ru = strength_map.get((strength or "").upper(), "")
-    result_label = {"TP": "TP ✅", "TSL": "Trailing Stop ✅", "SL": "SL ❌"}.get(result, result)
+    result_label = {
+        "TP": "TP ✅",
+        "TSL": "Trailing Stop ✅",
+        "MOM": "затуханию роста ✅",
+        "SL": "SL ❌",
+    }.get(result, result)
 
     msg = (
         f"Сделка по сигналу {asset} {timeframe} {signal_type.upper()} "
         f"закрыта по {result_label} по цене {price:.4f}"
         + (f" ({strength_ru})" if strength_ru else "")
     )
+    if tp1_price is not None:
+        part_txt = f" ({tp1_pnl_usd:+.2f}$)" if tp1_pnl_usd is not None else ""
+        msg += (
+            f"\nЧастями: {PARTIAL_EXIT_FRACTION * 100:.0f}% на TP1 {tp1_price:.4f}{part_txt}"
+            f" + остаток по {price:.4f}"
+        )
+    if tp_extensions:
+        msg += f"\nЦель продлевалась {tp_extensions} раз — тренд продолжался"
     if test_pnl_usd is not None and risk_usd:
         rr_text = f"{test_pnl_rr:+.2f}R" if test_pnl_rr is not None else ""
         msg += f"\nТест при риске {risk_usd:.2f}$: PnL {test_pnl_usd:+.2f}$ {rr_text}"
@@ -254,8 +342,8 @@ def track_signals(interval_seconds: int = 86400) -> None:
                     db.update_active_signal(db_id, data=signal)
                     continue
 
-                tp_level = get_tp_level(signal)
-                if tp_level is None:
+                tp_levels = get_tp_levels(signal)
+                if not tp_levels:
                     db.update_active_signal(db_id, data=signal)
                     continue
 
@@ -272,8 +360,13 @@ def track_signals(interval_seconds: int = 86400) -> None:
                 if "best_price" not in signal:
                     signal["best_price"] = entry_price
 
+                test_trade = signal.get("test_trade") or {}
+                risk_usd = float(test_trade.get("risk_usd", 0.0)) if isinstance(test_trade, dict) else 0.0
+                qty = float(test_trade.get("qty", 0.0)) if isinstance(test_trade, dict) else 0.0
+
                 fetch_tf = "1h" if timeframe == "manual" else timeframe
-                limit = _candles_needed(fetch_tf, interval_seconds)
+                # минимум 60 свечей — нужны для EMA9/21 при решении двигать TP
+                limit = max(_candles_needed(fetch_tf, interval_seconds), 60)
                 try:
                     df = exchange_manager.get_ohlcv(asset, fetch_tf, limit=limit)
                 except Exception as exc:
@@ -291,10 +384,15 @@ def track_signals(interval_seconds: int = 86400) -> None:
                 added_dt = _parse_added_at(signal)
                 tf_sec = _TF_SECONDS.get(fetch_tf, 86400)
 
+                # Для решения «двигать ли цель»: EMA9/21 по всей загруженной истории
+                closes_series = df["close"].astype(float)
+                ema9_series = closes_series.ewm(span=9, adjust=False).mean()
+                ema21_series = closes_series.ewm(span=21, adjust=False).mean()
+
                 result: Optional[str] = None
                 price: Optional[float] = None
 
-                for _, candle in df.iterrows():
+                for row_i, (_, candle) in enumerate(df.iterrows()):
                     ts = candle.get("timestamp")
                     ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
 
@@ -317,11 +415,35 @@ def track_signals(interval_seconds: int = 86400) -> None:
                     trailed_sl = calc_trailed_sl(signal, prev_best)
                     signal["trailed_sl"] = trailed_sl
 
+                    # Текущая цель: до частичного закрытия — TP1, после — TP2+
+                    # с возможным продлением; выше последнего TP — только трейлинг
+                    tp1_filled = bool(signal.get("tp1_filled"))
+                    tp_idx = int(signal.get("tp_index", 1 if tp1_filled else 0))
+                    tp_target: Optional[float] = (
+                        tp_levels[tp_idx] if tp_idx < len(tp_levels) else None
+                    )
+
+                    # После TP1 рост затух (EMA по закрытию ПРОШЛОЙ свечи) —
+                    # закрываем остаток по открытию текущей, не дожидаясь ни
+                    # следующей цели, ни отката до трейлинг-стопа. При гэпе
+                    # сквозь стоп ветка не срабатывает — ниже отработает SL/TSL.
+                    # row_i >= 22 — иначе False означает «мало истории», не слом.
+                    if tp1_filled and row_i >= 22 and not momentum_still_bullish(
+                        side, row_i, closes_series, ema9_series, ema21_series
+                    ):
+                        open_price = float(candle.get("open", candle["close"]))
+                        above_stop = (
+                            open_price > trailed_sl if side == "BUY" else open_price < trailed_sl
+                        )
+                        if above_stop:
+                            result, price = "MOM", open_price
+                            break
+
                     result, price = check_hit(
                         price_high=price_high,
                         price_low=price_low,
                         signal_type=signal_type,
-                        tp_level=tp_level,
+                        tp_level=tp_target,
                         sl_level=trailed_sl,
                     )
 
@@ -329,10 +451,47 @@ def track_signals(interval_seconds: int = 86400) -> None:
                         max(prev_best, price_high) if side == "BUY" else min(prev_best, price_low)
                     )
 
+                    if result == "TP" and not tp1_filled:
+                        # Частичное закрытие на TP1: фиксируем долю, остаток едет
+                        # дальше на трейлинге со стопом не ниже безубытка
+                        signal["tp1_filled"] = True
+                        signal["tp1_price"] = price
+                        signal["tp_index"] = 1
+                        if qty > 0:
+                            closed_qty = qty * PARTIAL_EXIT_FRACTION
+                            part_pnl = (
+                                (price - entry_price) * closed_qty if side == "BUY"
+                                else (entry_price - price) * closed_qty
+                            )
+                            signal["realized_pnl_usd"] = part_pnl
+                        result, price = None, None
+                        # остальные проверки этой же свечи пропускаем: порядок
+                        # хай/лоу внутри свечи неизвестен (заглядывание в будущее)
+                        continue
+
+                    if result == "TP" and tp1_filled and momentum_still_bullish(
+                        side, row_i, closes_series, ema9_series, ema21_series
+                    ):
+                        # Цена дошла до цели, но тренд жив — двигаем TP на
+                        # следующий уровень вместо закрытия; выше последнего
+                        # уровня остаток ведёт только трейлинг-стоп
+                        signal["tp_index"] = tp_idx + 1
+                        signal["tp_extensions"] = int(signal.get("tp_extensions") or 0) + 1
+                        logger.info(
+                            "TP продлён %s/%s: цель %.4f взята, тренд жив → следующая %s",
+                            asset, timeframe, price,
+                            f"{tp_levels[tp_idx + 1]:.4f}" if tp_idx + 1 < len(tp_levels) else "трейлинг",
+                        )
+                        result, price = None, None
+                        continue
+
                     if result == "SL":
                         if side == "BUY" and trailed_sl > entry_price:
                             result, price = "TSL", trailed_sl
                         elif side == "SELL" and trailed_sl < entry_price:
+                            result, price = "TSL", trailed_sl
+                        elif tp1_filled:
+                            # стоп остатка в безубытке, часть прибыли уже взята
                             result, price = "TSL", trailed_sl
 
                     if result is not None:
@@ -343,6 +502,23 @@ def track_signals(interval_seconds: int = 86400) -> None:
                     move_pct = (float(signal["trailed_sl"]) - entry_price) / entry_price * 100
                     logger.info("TSL %s/%s: SL → %.4f (%+.2f%% от входа)", asset, timeframe, float(signal["trailed_sl"]), move_pct)
 
+                # TP1 взят частично — сообщаем один раз, позиция остаётся активной
+                if signal.get("tp1_filled") and not signal.get("tp1_notified"):
+                    signal["tp1_notified"] = True
+                    part_pnl = signal.get("realized_pnl_usd")
+                    part_txt = f" ({float(part_pnl):+.2f}$)" if part_pnl is not None else ""
+                    partial_text = (
+                        f"🎯 {asset} {timeframe} {signal_type.upper()}: TP1 "
+                        f"{float(signal['tp1_price']):.4f} достигнут — закрыто "
+                        f"{PARTIAL_EXIT_FRACTION * 100:.0f}%{part_txt}\n"
+                        f"Остаток в трейлинге, стоп не ниже безубытка {entry_price:.4f}"
+                    )
+                    for chat_id in subscribers:
+                        try:
+                            send_telegram_message(token=TELEGRAM_BOT_TOKEN, chat_id=chat_id, text=partial_text)
+                        except Exception as exc:
+                            logger.warning("Ошибка отправки TP1-уведомления %s/%s подписчику %d: %s", asset, timeframe, chat_id, exc)
+
                 if result is None or price is None:
                     db.update_active_signal(db_id, data=signal)
                     continue
@@ -350,21 +526,22 @@ def track_signals(interval_seconds: int = 86400) -> None:
                 signal["status"] = result
                 signal["closed_price"] = price
 
-                test_trade = signal.get("test_trade") or {}
-                risk_usd = float(test_trade.get("risk_usd", 0.0)) if isinstance(test_trade, dict) else 0.0
-                qty = float(test_trade.get("qty", 0.0)) if isinstance(test_trade, dict) else 0.0
-
                 test_pnl_usd = None
                 test_pnl_rr = None
                 if qty > 0 and risk_usd > 0:
-                    pnl = (price - float(signal["entry_price"])) * qty if side == "BUY" else (float(signal["entry_price"]) - price) * qty
+                    remaining_qty = qty * (1.0 - PARTIAL_EXIT_FRACTION) if signal.get("tp1_filled") else qty
+                    pnl = (
+                        (price - entry_price) * remaining_qty if side == "BUY"
+                        else (entry_price - price) * remaining_qty
+                    )
+                    pnl += float(signal.get("realized_pnl_usd") or 0.0)
                     test_pnl_usd = pnl
                     test_pnl_rr = pnl / risk_usd
                     signal["test_pnl_usd"] = test_pnl_usd
                     signal["test_pnl_rr"] = test_pnl_rr
 
                 total_closed += 1
-                if result in ("TP", "TSL"):
+                if result in ("TP", "TSL", "MOM"):
                     wins += 1
                 elif result == "SL":
                     losses += 1
@@ -392,7 +569,7 @@ def track_signals(interval_seconds: int = 86400) -> None:
                         "qty": qty if qty > 0 else None,
                         "pnl_usd": test_pnl_usd,
                         "pnl_rr": test_pnl_rr,
-                        "opened_at": None,
+                        "opened_at": _parse_added_at(signal),
                         "closed_at": datetime.utcnow(),
                         "source": "tracker",
                         "signal_snapshot": {k: v for k, v in signal.items() if k != "_db_id"},
@@ -413,6 +590,9 @@ def track_signals(interval_seconds: int = 86400) -> None:
                     win_rate=win_rate,
                     total_closed=total_closed,
                     wins=wins,
+                    tp1_price=float(signal["tp1_price"]) if signal.get("tp1_filled") and signal.get("tp1_price") else None,
+                    tp1_pnl_usd=float(signal["realized_pnl_usd"]) if signal.get("realized_pnl_usd") is not None else None,
+                    tp_extensions=int(signal.get("tp_extensions") or 0),
                 )
                 for chat_id in subscribers:
                     try:

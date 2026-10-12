@@ -48,6 +48,10 @@ assets:
   - ILV      # Illuvium (гейминг)
   - WLD      # Worldcoin
   - 1INCH  # 1inch
+  - ICP      # Internet Computer
+  - FIL      # Filecoin
+  - CAKE     # PancakeSwap
+  - MARSCOIN # Marscoin (мем; в scan_blacklist для сканов, на вотчлист это не влияет)
   # - HYPE   # HYPE/USDT — нет на Binance spot, включить при появлении пары
   - "LAB/USDT:USDT"  # LABtrade — на Binance только perpetual (spot нет), качаем свечи с фьючерсов
   # - XMR    # Monero — делистнут с Binance
@@ -88,7 +92,7 @@ analysis:
     symmetry_tolerance: 0.1
   signals:
     min_confidence: 0.7
-    test_risk_usd: 10.0
+    test_risk_usd: 2.9     # риск на сделку под депозит 888$ и общий лимит 3% (paper-тест с 2026-10-11)
 
 updates:
   interval_seconds: 60
